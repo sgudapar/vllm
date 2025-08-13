@@ -310,10 +310,10 @@ class RandomDataset(BenchmarkDataset):
             "random_range_ratio must be < 1.0 to ensure a valid sampling range"
         )
 
-         print("****************")
-         print("ENTER RANDOM DATASET")
-         np.random.seed(7001)
-         print("****************")
+        print("****************")
+        print("ENTER RANDOM DATASET")
+        np.random.seed(7001)
+        print("****************")
 
         vocab_size = tokenizer.vocab_size
         num_special_tokens = tokenizer.num_special_tokens_to_add()
