@@ -49,6 +49,12 @@ def find_seq_idx(query_start_len_ptr, target_idx, num_seqs,
 @triton.jit
 def kernel_unified_attention_2d(
         output_ptr,  # [num_tokens, num_query_heads, head_size]
+        L_ptr,
+        M_ptr,
+        L_stride_0,
+        L_stride_1,
+        M_stride_0,
+        M_stride_1,
         query_ptr,  # [num_tokens, num_query_heads, head_size]
         key_cache_ptr,  # [num_blks, blk_size, num_kv_heads, head_size]
         value_cache_ptr,  # [num_blks, blk_size, num_kv_heads, head_size]
@@ -285,6 +291,12 @@ def kernel_unified_attention_2d(
     output_offset = (query_offset_0[:, None] * output_stride_0 +
                      query_offset_1[:, None] * output_stride_1 +
                      offs_d[None, :])
+
+    exp_sum_offset = (query_offset_0 * L_stride_0 + query_offset_1 * L_stride_1)
+    max_logit_offset = (query_offset_0 * M_stride_0 + query_offset_1 * M_stride_1)
+
+    tl.store(L_ptr + exp_sum_offset, L, mask=query_mask_0 & query_mask_1)
+    tl.store(M_ptr + max_logit_offset, M, mask=query_mask_0 & query_mask_1)
 
     tl.store(
         output_ptr + output_offset,
@@ -553,6 +565,12 @@ def kernel_unified_attention_3d(
 @triton.jit
 def reduce_segments(
         output_ptr,  # [num_tokens, num_query_heads, head_size]
+        L_ptr,
+        M_ptr,
+        L_stride_0,
+        L_stride_1,
+        M_stride_0,
+        M_stride_1,
         segm_output_ptr,
         #[num_tokens, num_query_heads, max_num_segments, head_size]
         segm_max_ptr,  # [num_tokens, num_query_heads, max_num_segments]
@@ -624,6 +642,12 @@ def reduce_segments(
     # safely divide by overall_expsum, returning 0.0 if overall_expsum is 0
     acc = tl.where(overall_expsum == 0.0, 0.0, acc_sum / overall_expsum)
 
+    exp_sum_offset = (query_token_idx * L_stride_0 + query_head_idx * L_stride_1)
+    max_logit_offset = (query_token_idx * M_stride_0 + query_head_idx * M_stride_1)
+
+    tl.store(L_ptr + exp_sum_offset, overall_expsum)
+    tl.store(M_ptr + max_logit_offset, overall_max)
+
     # write result
     output_offset = (query_token_idx * output_stride_0 +
                      query_head_idx * output_stride_1 +
@@ -674,6 +698,9 @@ def unified_attention(
     num_queries_per_kv = num_query_heads // num_kv_heads
     head_size = q.shape[2]
 
+    xcd_exp_sum = torch.empty( q.shape[0], num_query_heads, dtype=torch.float32, device=q.device,)
+    xcd_max_logit = torch.empty(q.shape[0], num_query_heads, dtype=torch.float32, device=q.device,)
+
     BLOCK_M = 16
     BLOCK_Q = BLOCK_M // num_queries_per_kv
 
@@ -695,6 +722,12 @@ def unified_attention(
             num_kv_heads,
         )](
             output_ptr=out,
+            L_ptr=xcd_exp_sum,
+            M_ptr=xcd_max_logit,
+            L_stride_0=xcd_exp_sum.stride(0),
+            L_stride_1=xcd_exp_sum.stride(1),
+            M_stride_0=xcd_max_logit.stride(0),
+            M_stride_1=xcd_max_logit.stride(1),
             query_ptr=q,
             key_cache_ptr=k,
             value_cache_ptr=v,
@@ -812,6 +845,12 @@ def unified_attention(
 
         reduce_segments[(q.shape[0], num_query_heads)](
             output_ptr=out,
+            L_ptr=xcd_exp_sum,
+            M_ptr=xcd_max_logit,
+            L_stride_0=xcd_exp_sum.stride(0),
+            L_stride_1=xcd_exp_sum.stride(1),
+            M_stride_0=xcd_max_logit.stride(0),
+            M_stride_1=xcd_max_logit.stride(1),
             segm_output_ptr=segm_output,
             segm_max_ptr=segm_max,
             segm_expsum_ptr=segm_expsum,
