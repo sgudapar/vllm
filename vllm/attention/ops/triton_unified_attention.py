@@ -15,6 +15,65 @@ from vllm.distributed import cpx_model_parallel_all_gather
 
 logger = init_logger(__name__)
 
+@torch.jit.script
+def paged_reduct(inter_xcd_max_logit: torch.Tensor, ## M_i
+                    inter_xcd_exp_sums: torch.Tensor,  ##L_i
+                    inter_xcd_outd: torch.Tensor,  ## O_i
+                    cpx_total_num_heads: int) -> torch.Tensor:
+
+    #fix view of AG tensors
+    all_XCD_logits = inter_xcd_max_logit.view(
+        inter_xcd_max_logit.shape[0],
+        inter_xcd_max_logit.shape[1] // cpx_total_num_heads,
+        cpx_total_num_heads
+    )
+
+    #same dim+sizes as M_i
+    all_XCD_exp_sums = inter_xcd_exp_sums.view(
+        inter_xcd_exp_sums.shape[0],
+        inter_xcd_exp_sums.shape[1] // cpx_total_num_heads,
+        cpx_total_num_heads
+    )
+    # review AG outd
+    # allgather in dim 1 instead of last dim -- fewer changes w.r.t. following compute
+    all_XCD_outd = inter_xcd_outd.view(
+        inter_xcd_outd.shape[0],
+        inter_xcd_outd.shape[1] // cpx_total_num_heads,
+        cpx_total_num_heads,
+        inter_xcd_outd.shape[2]
+    )
+
+    max_logits_final = torch.max(all_XCD_logits, dim=1)[0]
+
+    # expand is a view of original tensor.  tensor.repeat will return a new tensor
+    # -1 => don't change those dims
+    broadcast_max_logits_final = max_logits_final.unsqueeze(1).expand(-1, max_logits_final.shape[1] // cpx_total_num_heads, -1)
+
+
+    # shapes should match for the elt. subtraction
+    delta_logits = all_XCD_logits - broadcast_max_logits_final
+
+    # elt.wise op - no changes
+    alpha = torch.exp(delta_logits)
+
+    # torch.mul, '*' are elt. wise
+    per_xcd_exp_sums_offset = torch.mul(alpha, all_XCD_exp_sums)
+
+    per_xcd_exp_sums_expanded = per_xcd_exp_sums_offset.unsqueeze(-1)
+
+    all_xcd_output = all_XCD_outd * per_xcd_exp_sums_expanded
+
+    #### last stretch
+    # add O_* and L_*
+    added_all_xcd_output = torch.sum(all_xcd_output, dim=1)
+    added_all_xcd_exp_sums = torch.sum(per_xcd_exp_sums_expanded, dim=1)
+
+    # divide
+    outputs = added_all_xcd_output / added_all_xcd_exp_sums
+
+    return outputs
+
+
 
 @triton.jit
 def cdiv_fn(x, y):
@@ -870,4 +929,11 @@ def unified_attention(
         )
     inter_xcd_max_logit = cpx_model_parallel_all_gather(xcd_max_logit.contiguous())
     inter_xcd_exp_sums = cpx_model_parallel_all_gather(xcd_exp_sum.contiguous())
+    outd = torch.empty_like(out)
+    outd.copy_(out)
+    inter_xcd_outd = cpx_model_parallel_all_gather(outd.contiguous(), dim=-2)
+
+    final_output = paged_reduct(inter_xcd_max_logit, inter_xcd_exp_sums, inter_xcd_outd, num_query_heads * 4)
+
+
 
