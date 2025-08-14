@@ -889,6 +889,13 @@ def init_model_parallel_group(
     )
 
 
+_CP: Optional[GroupCoordinator] = None
+
+def get_cp_group() -> GroupCoordinator:
+    assert _CP is not None, ("tensor model parallel group is not initialized")
+    return _CP
+
+
 _TP: Optional[GroupCoordinator] = None
 
 
@@ -951,7 +958,7 @@ def graph_capture(device: torch.device):
     from other kernels possibly launched on background in the default stream.
     """
     context = GraphCaptureContext(torch.cuda.Stream(device=device))
-    with get_tp_group().graph_capture(context), get_pp_group().graph_capture(
+    with get_tp_group().graph_capture(context), get_cp_group().graph_capture(context), get_pp_group().graph_capture(
             context):
         yield context
 
@@ -1085,6 +1092,25 @@ def initialize_model_parallel(
         -1, data_parallel_size, pipeline_model_parallel_size,
         tensor_model_parallel_size)  # noqa
 
+    # Build the cpx model-parallel groups.
+    cpx_model_parallel_size = 4
+    num_cpx_model_parallel_groups: int = (world_size //
+                                             cpx_model_parallel_size)
+    global _CP
+    group_ranks = []
+    for i in range(num_cpx_model_parallel_groups):
+        ranks = list(
+            range(i * cpx_model_parallel_size,
+                  (i + 1) * cpx_model_parallel_size))
+        group_ranks.append(ranks)
+
+    # message queue broadcaster is also used in Starscream cpx model parallel groups as the matrix is split across machines
+    _CP = init_model_parallel_group(group_ranks,
+                                    get_world_group().local_rank,
+                                    backend,
+                                    use_message_queue_broadcaster=True,
+                                    group_name="cp")
+
     # Build the tensor model-parallel groups.
     global _TP
     assert _TP is None, ("tensor model parallel group is already initialized")
@@ -1185,7 +1211,7 @@ def prepare_communication_buffer_for_model(model: torch.nn.Module):
 
 def model_parallel_is_initialized():
     """Check if tensor and pipeline parallel groups are initialized."""
-    return (_TP is not None and _PP is not None)
+    return (_TP is not None and _PP is not None and _CP is not None)
 
 
 _TP_STATE_PATCHED = False
@@ -1255,6 +1281,11 @@ def destroy_model_parallel():
     if _EP:
         _EP.destroy()
     _EP = None
+
+    global _CP
+    if _CP:
+        _CP.destroy()
+    _CP = None
 
 
 def destroy_distributed_environment():

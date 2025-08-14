@@ -11,6 +11,7 @@ import torch
 
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
+from vllm.distributed import cpx_model_parallel_all_gather
 
 logger = init_logger(__name__)
 
@@ -867,3 +868,6 @@ def unified_attention(
             BLOCK_Q=BLOCK_Q,
             NUM_SEGMENTS_PER_SEQ=NUM_SEGMENTS,
         )
+    inter_xcd_max_logit = cpx_model_parallel_all_gather(xcd_max_logit.contiguous())
+    inter_xcd_exp_sums = cpx_model_parallel_all_gather(xcd_exp_sum.contiguous())
+
