@@ -927,13 +927,15 @@ def unified_attention(
             BLOCK_Q=BLOCK_Q,
             NUM_SEGMENTS_PER_SEQ=NUM_SEGMENTS,
         )
-    inter_xcd_max_logit = cpx_model_parallel_all_gather(xcd_max_logit.contiguous())
-    inter_xcd_exp_sums = cpx_model_parallel_all_gather(xcd_exp_sum.contiguous())
-    outd = torch.empty_like(out)
-    outd.copy_(out)
-    inter_xcd_outd = cpx_model_parallel_all_gather(outd.contiguous(), dim=-2)
 
-    final_output = paged_reduct(inter_xcd_max_logit, inter_xcd_exp_sums, inter_xcd_outd, num_query_heads * 4)
+    if not max_seqlen_q > 1:
+        inter_xcd_max_logit = cpx_model_parallel_all_gather(xcd_max_logit.contiguous()) 
+        inter_xcd_exp_sums = cpx_model_parallel_all_gather(xcd_exp_sum.contiguous())
+        outd = torch.empty_like(out)
+        outd.copy_(out)
+        inter_xcd_outd = cpx_model_parallel_all_gather(outd.contiguous(), dim=-2)
+
+        final_output = paged_reduct(inter_xcd_max_logit, inter_xcd_exp_sums, inter_xcd_outd, num_query_heads * 4)
 
 
 
