@@ -25,6 +25,93 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 logger = init_logger(__name__)
 
+from typing import List, Tuple
+
+@torch.jit.script
+def slice_and_stitch_three(
+    t1: torch.Tensor,
+    t2: torch.Tensor,
+    t3: torch.Tensor,
+    N: int,
+    slice_idx: int,
+    slice_len: int,
+    d_idx: int,
+    g_id: int,
+    has_A: bool
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Slice-and-stitch along dim=0 for three tensors.
+    Handles optional special entry A at index 0 if has_A=True.
+    If has_A=False, all entries are just batches of size N.
+
+    Args:
+        t1, t2, t3: Tensors with shape
+            [ (B - 1) * N + 1, ... ] if has_A=True
+            [ B * N, ... ]          if has_A=False
+        N: prefill length
+        slice_idx: start index within each batch slice
+        slice_len: number of items to take
+        d_idx, g_id: include entry 0 ("A") only if has_A and g_id == d_idx
+        has_A: whether the tensors contain a special entry at index 0
+
+    Returns:
+        (out1, out2, out3): stitched tensors from t1, t2, t3
+    """
+    M1 = t1.size(0)
+    M2 = t2.size(0)
+    M3 = t3.size(0)
+
+    # First dimension must match
+    assert M1 == M2 and M1 == M3
+
+    # Number of batches depends on has_A
+    if has_A:
+        assert (M1 - 1) % N == 0
+        num_batches = (M1 - 1) // N
+        base_offset = 1
+    else:
+        assert M1 % N == 0
+        num_batches = M1 // N
+        base_offset = 0
+
+    assert slice_idx >= 0
+    assert slice_len > 0
+
+    pieces1: List[torch.Tensor] = []
+    pieces2: List[torch.Tensor] = []
+    pieces3: List[torch.Tensor] = []
+
+    # Include A if requested
+    if has_A and g_id == d_idx:
+        pieces1.append(t1[0:1])
+        pieces2.append(t2[0:1])
+        pieces3.append(t3[0:1])
+
+    # Add per-batch slices with clipping
+    for b in range(num_batches):
+        batch_start = base_offset + b * N
+        start = batch_start + slice_idx
+        end = start + slice_len
+        batch_end = batch_start + N
+
+        if start >= batch_end:
+            continue
+        if end > batch_end:
+            end = batch_end
+
+        pieces1.append(t1[start:end])
+        pieces2.append(t2[start:end])
+        pieces3.append(t3[start:end])
+
+    return (
+        torch.cat(pieces1, dim=0),
+        torch.cat(pieces2, dim=0),
+        torch.cat(pieces3, dim=0),
+    )
+
+
+
+
 
 @dataclass
 class TritonAttentionMetadata:
@@ -319,6 +406,21 @@ class TritonAttentionImpl(AttentionImpl):
 
         use_prefill_decode_attn = self.force_prefill_decode_attn
         num_actual_tokens = attn_metadata.num_actual_tokens
+
+        max_seqlen_q = attn_metadata.max_query_len
+        seqused_k = attn_metadata.seq_lens
+        if (len(seqused_k) > 1):
+            cpx_size = 4
+            query_seq_lens = max_seqlen_q
+            new_seq = ((query_seq_lens + cpx_size - 1) // cpx_size) * cpx_size
+            start_idx = 0
+            slice_len = new_seq // cpx_size
+            tp_rank = 0
+            slice_idx = ((tp_rank - start_idx + cpx_size) % cpx_size) * slice_len
+            print(key.size(0), query_seq_lens)
+
+            out1, out2, out3 = slice_and_stitch_three(key, value, attn_metadata.slot_mapping, query_seq_lens, slice_idx, slice_len, d_idx=0, g_id=0, has_A=True)
+
 
         if use_prefill_decode_attn:
             key_cache, value_cache = PagedAttention.split_kv_cache(
