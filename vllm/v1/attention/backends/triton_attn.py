@@ -22,7 +22,11 @@ from vllm.v1.attention.backends.utils import (AttentionCGSupport,
                                               AttentionMetadataBuilder,
                                               CommonAttentionMetadata)
 from vllm.v1.kv_cache_interface import AttentionSpec
-
+from vllm.distributed import (divide, get_tensor_model_parallel_rank,
+                              get_tensor_model_parallel_world_size,
+                              split_tensor_along_last_dim,
+                              tensor_model_parallel_all_gather, cpx_model_parallel_all_gather, cpx_model_parallel_all_reduce,
+                              tensor_model_parallel_all_reduce)
 logger = init_logger(__name__)
 
 from typing import List, Tuple
@@ -102,6 +106,9 @@ def slice_and_stitch_three(
         pieces1.append(t1[start:end])
         pieces2.append(t2[start:end])
         pieces3.append(t3[start:end])
+
+    if (len(pieces1) == 0):
+        return torch.empty_like(t1), torch.empty_like(t2), torch.empty_like(t3)
 
     return (
         torch.cat(pieces1, dim=0),
@@ -415,11 +422,15 @@ class TritonAttentionImpl(AttentionImpl):
             new_seq = ((query_seq_lens + cpx_size - 1) // cpx_size) * cpx_size
             start_idx = 0
             slice_len = new_seq // cpx_size
-            tp_rank = 0
+            tp_rank = get_tensor_model_parallel_rank()
             slice_idx = ((tp_rank - start_idx + cpx_size) % cpx_size) * slice_len
-            print(key.size(0), query_seq_lens)
 
-            out1, out2, out3 = slice_and_stitch_three(key, value, attn_metadata.slot_mapping, query_seq_lens, slice_idx, slice_len, d_idx=0, g_id=0, has_A=True)
+            d_match = (seqused_k[0].item() - 1) % cpx_size
+            d_idx = (d_match == tp_rank % cpx_size)
+            g_idx = tp_rank % cpx_size
+
+            out1, out2, out3 = slice_and_stitch_three(key, value, attn_metadata.slot_mapping, query_seq_lens, slice_idx, slice_len, d_idx, g_idx, has_A=True)
+            print(seqused_k[0], d_match, g_idx, d_idx)
 
 
         if use_prefill_decode_attn:
