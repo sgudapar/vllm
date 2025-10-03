@@ -285,7 +285,7 @@ __global__ void reshape_and_cache_flash_kernel(
     const int64_t* __restrict__ slot_mapping,  // [num_tokens]
     const int64_t block_stride, const int64_t page_stride,
     const int64_t head_stride, const int64_t key_stride,
-    const int64_t value_stride, const int num_heads, const int head_size,
+    const int64_t value_stride, const int num_heads, const int head_size, const bool location_match,
     const int block_size, const float* k_scale, const float* v_scale) {
   const int64_t token_idx = blockIdx.x;
   const int64_t slot_idx = slot_mapping[token_idx];
@@ -293,6 +293,11 @@ __global__ void reshape_and_cache_flash_kernel(
   if (slot_idx < 0) {
     return;
   }
+
+  if (!location_match) {
+    return;
+  }
+ 
   const int64_t block_idx = slot_idx / block_size;
   const int64_t block_offset = slot_idx % block_size;
   const int n_elems = num_heads * head_size;
@@ -451,7 +456,7 @@ void reshape_and_cache(
           reinterpret_cast<CACHE_T*>(key_cache.data_ptr()),               \
           reinterpret_cast<CACHE_T*>(value_cache.data_ptr()),             \
           slot_mapping.data_ptr<int64_t>(), block_stride, page_stride,    \
-          head_stride, key_stride, value_stride, num_heads, head_size,    \
+          head_stride, key_stride, value_stride, num_heads, head_size, location_match,    \
           block_size, reinterpret_cast<const float*>(k_scale.data_ptr()), \
           reinterpret_cast<const float*>(v_scale.data_ptr()));
 
@@ -490,6 +495,8 @@ void reshape_and_cache_flash(
   dim3 block(std::min(num_heads * head_size, 512));
   const at::cuda::OptionalCUDAGuard device_guard(device_of(key));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  const bool location_match = (1==1);
 
   DISPATCH_BY_KV_CACHE_DTYPE(key.dtype(), kv_cache_dtype,
                              CALL_RESHAPE_AND_CACHE_FLASH);
