@@ -416,21 +416,27 @@ class TritonAttentionImpl(AttentionImpl):
 
         max_seqlen_q = attn_metadata.max_query_len
         seqused_k = attn_metadata.seq_lens
-        if (len(seqused_k) > 1):
-            cpx_size = 4
-            query_seq_lens = max_seqlen_q
-            new_seq = ((query_seq_lens + cpx_size - 1) // cpx_size) * cpx_size
-            start_idx = 0
-            slice_len = new_seq // cpx_size
-            tp_rank = get_tensor_model_parallel_rank()
-            slice_idx = ((tp_rank - start_idx + cpx_size) % cpx_size) * slice_len
+        batch_size = 2
+        cpx_size = 4
+        has_A = (len(seqused_k) == batch_size)
+        query_seq_lens = max_seqlen_q
+        new_seq = ((query_seq_lens + cpx_size - 1) // cpx_size) * cpx_size
+        start_idx = 0
+        slice_len = new_seq // cpx_size
+        tp_rank = get_tensor_model_parallel_rank()
+        slice_idx = ((tp_rank - start_idx + cpx_size) % cpx_size) * slice_len
 
-            d_match = (seqused_k[0].item() - 1) % cpx_size
-            d_idx = (d_match == tp_rank % cpx_size)
-            g_idx = tp_rank % cpx_size
+        d_idx = (seqused_k[0].item() - 1) % cpx_size
+        non_cold_location_match = (seqused_k[-1].item() - 1) % cpx_size
+        #d_match = (seqused_k[0].item() - 1) % cpx_size
+        #d_idx = (d_match == tp_rank % cpx_size)
+        g_idx = tp_rank % cpx_size
 
-            out1, out2, out3 = slice_and_stitch_three(key, value, attn_metadata.slot_mapping, query_seq_lens, slice_idx, slice_len, d_idx, g_idx, has_A=True)
-            print(seqused_k[0], d_match, g_idx, d_idx)
+        out1, out2, out3 = slice_and_stitch_three(key, value, attn_metadata.slot_mapping, query_seq_lens, slice_idx, slice_len, d_idx, g_idx, has_A)
+
+        location_match = (d_idx == g_idx) or (non_cold_location_match == g_idx) or (max_seqlen_q > 1)
+
+        print(tp_rank, seqused_k[0].item(), has_A, location_match)
 
 
         if use_prefill_decode_attn:
