@@ -41,7 +41,8 @@ def slice_and_stitch_three(
     slice_len: int,
     d_idx: int,
     g_id: int,
-    has_A: bool
+    has_A: bool,
+    prefill_decode_match: bool
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Slice-and-stitch along dim=0 for three tensors.
@@ -92,20 +93,21 @@ def slice_and_stitch_three(
         pieces3.append(t3[0:1])
 
     # Add per-batch slices with clipping
-    for b in range(num_batches):
-        batch_start = base_offset + b * N
-        start = batch_start + slice_idx
-        end = start + slice_len
-        batch_end = batch_start + N
+    if (prefill_decode_match):
+        for b in range(num_batches):
+            batch_start = base_offset + b * N
+            start = batch_start + slice_idx
+            end = start + slice_len
+            batch_end = batch_start + N
 
-        if start >= batch_end:
-            continue
-        if end > batch_end:
-            end = batch_end
+            if start >= batch_end:
+                continue
+            if end > batch_end:
+                end = batch_end
 
-        pieces1.append(t1[start:end])
-        pieces2.append(t2[start:end])
-        pieces3.append(t3[start:end])
+            pieces1.append(t1[start:end])
+            pieces2.append(t2[start:end])
+            pieces3.append(t3[start:end])
 
     if (len(pieces1) == 0):
         return torch.empty_like(t1), torch.empty_like(t2), torch.empty_like(t3)
@@ -432,11 +434,17 @@ class TritonAttentionImpl(AttentionImpl):
         #d_idx = (d_match == tp_rank % cpx_size)
         g_idx = tp_rank % cpx_size
 
-        out1, out2, out3 = slice_and_stitch_three(key, value, attn_metadata.slot_mapping, query_seq_lens, slice_idx, slice_len, d_idx, g_idx, has_A)
+        prefill_match = (max_seqlen_q > 1)
+        decode_match = (non_cold_location_match == g_idx)
+        cold_start_match = (d_idx == g_idx)
 
-        location_match = (d_idx == g_idx) or (non_cold_location_match == g_idx) or (max_seqlen_q > 1)
+        prefill_decode_match = prefill_match or decode_match
 
-        print(tp_rank, seqused_k[0].item(), has_A, location_match)
+        out1, out2, out3 = slice_and_stitch_three(key, value, attn_metadata.slot_mapping, query_seq_lens, slice_idx, slice_len, d_idx, g_idx, has_A, prefill_decode_match)
+
+        location_match = cold_start_match or prefill_decode_match
+
+        #print(tp_rank, seqused_k[0].item(), has_A, location_match)
 
 
         if use_prefill_decode_attn:
