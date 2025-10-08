@@ -454,6 +454,8 @@ class TritonAttentionImpl(AttentionImpl):
 
         location_match = cold_start_match or prefill_decode_match
 
+        location_match = True
+
         #print(tp_rank, seqused_k[0].item(), has_A, location_match)
 
 
@@ -484,6 +486,7 @@ class TritonAttentionImpl(AttentionImpl):
                     key_cache,
                     value_cache,
                     attn_metadata.slot_mapping,
+                    location_match,
                     self.kv_cache_dtype,
                     layer._k_scale,
                     layer._v_scale,
