@@ -37,10 +37,10 @@ def slice_and_stitch_three(
     t2: torch.Tensor,
     t3: torch.Tensor,
     N: int,
-    slice_idx: int,
-    slice_len: int,
     d_idx: int,
     g_id: int,
+    tp_rank: int,
+    cpx_size: int,
     has_A: bool,
     prefill_decode_match: bool
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -66,6 +66,16 @@ def slice_and_stitch_three(
     M2 = t2.size(0)
     M3 = t3.size(0)
 
+    base = N // cpx_size
+    extra = N % cpx_size
+
+    if (tp_rank < extra):
+        slice_len = base + 1
+        slice_idx = tp_rank * (base + 1)
+    else:
+        slice_len = base
+        slice_idx = extra * (base + 1) + (tp_rank - extra) * base
+
     # First dimension must match
     assert M1 == M2 and M1 == M3
 
@@ -80,7 +90,7 @@ def slice_and_stitch_three(
         base_offset = 0
 
     assert slice_idx >= 0
-    assert slice_len > 0
+    assert slice_len >= 0
 
     pieces1: List[torch.Tensor] = []
     pieces2: List[torch.Tensor] = []
@@ -100,7 +110,7 @@ def slice_and_stitch_three(
             end = start + slice_len
             batch_end = batch_start + N
 
-            if start >= batch_end:
+            if (start >= batch_end) or (start == end):
                 continue
             if end > batch_end:
                 end = batch_end
@@ -422,11 +432,11 @@ class TritonAttentionImpl(AttentionImpl):
         cpx_size = 4
         has_A = (len(seqused_k) == batch_size)
         query_seq_lens = max_seqlen_q
-        new_seq = ((query_seq_lens + cpx_size - 1) // cpx_size) * cpx_size
-        start_idx = 0
-        slice_len = new_seq // cpx_size
+        #new_seq = ((query_seq_lens + cpx_size - 1) // cpx_size) * cpx_size
+        #start_idx = 0
+        #slice_len = new_seq // cpx_size
         tp_rank = get_tensor_model_parallel_rank()
-        slice_idx = ((tp_rank - start_idx + cpx_size) % cpx_size) * slice_len
+        #slice_idx = ((tp_rank - start_idx + cpx_size) % cpx_size) * slice_len
 
         d_idx = (seqused_k[0].item() - 1) % cpx_size
         non_cold_location_match = (seqused_k[-1].item() - 1) % cpx_size
@@ -440,7 +450,7 @@ class TritonAttentionImpl(AttentionImpl):
 
         prefill_decode_match = prefill_match or decode_match
 
-        out1, out2, out3 = slice_and_stitch_three(key, value, attn_metadata.slot_mapping, query_seq_lens, slice_idx, slice_len, d_idx, g_idx, has_A, prefill_decode_match)
+        out1, out2, out3 = slice_and_stitch_three(key, value, attn_metadata.slot_mapping, query_seq_lens, d_idx, g_idx, tp_rank, cpx_size, has_A, prefill_decode_match)
 
         location_match = cold_start_match or prefill_decode_match
 
