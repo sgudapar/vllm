@@ -42,7 +42,8 @@ def slice_and_stitch_three(
     tp_rank: int,
     cpx_size: int,
     has_A: bool,
-    prefill_decode_match: bool
+    prefill_decode_match: bool,
+    prefill_match: bool
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Slice-and-stitch along dim=0 for three tensors.
@@ -75,6 +76,10 @@ def slice_and_stitch_three(
     else:
         slice_len = base
         slice_idx = extra * (base + 1) + (tp_rank - extra) * base
+
+    if not prefill_match:
+        slice_len = 1
+        slice_idx = 0
 
     # First dimension must match
     assert M1 == M2 and M1 == M3
@@ -450,7 +455,7 @@ class TritonAttentionImpl(AttentionImpl):
 
         prefill_decode_match = prefill_match or decode_match
 
-        out1, out2, out3 = slice_and_stitch_three(key, value, attn_metadata.slot_mapping, query_seq_lens, d_idx, g_idx, tp_rank, cpx_size, has_A, prefill_decode_match)
+        out1, out2, out3 = slice_and_stitch_three(key, value, attn_metadata.slot_mapping, query_seq_lens, d_idx, g_idx, tp_rank, cpx_size, has_A, prefill_decode_match, prefill_match)
 
         location_match = cold_start_match or prefill_decode_match
 
