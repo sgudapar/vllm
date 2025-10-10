@@ -44,7 +44,7 @@ def slice_and_stitch_three(
     has_A: bool,
     prefill_decode_match: bool,
     prefill_match: bool
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
     """
     Slice-and-stitch along dim=0 for three tensors.
     Handles optional special entry A at index 0 if has_A=True.
@@ -86,16 +86,16 @@ def slice_and_stitch_three(
 
     # Number of batches depends on has_A
     if has_A:
-        assert (M1 - 1) % N == 0
+        #assert (M1 - 1) % N == 0
         num_batches = (M1 - 1) // N
         base_offset = 1
     else:
-        assert M1 % N == 0
+        #assert M1 % N == 0
         num_batches = M1 // N
         base_offset = 0
 
-    assert slice_idx >= 0
-    assert slice_len >= 0
+#    assert slice_idx >= 0
+#    assert slice_len >= 0
 
     pieces1: List[torch.Tensor] = []
     pieces2: List[torch.Tensor] = []
@@ -125,12 +125,13 @@ def slice_and_stitch_three(
             pieces3.append(t3[start:end])
 
     if (len(pieces1) == 0):
-        return torch.empty_like(t1), torch.empty_like(t2), torch.empty_like(t3)
+        return torch.empty_like(t1), torch.empty_like(t2), torch.empty_like(t3), slice_idx
 
     return (
-        torch.cat(pieces1, dim=0),
-        torch.cat(pieces2, dim=0),
-        torch.cat(pieces3, dim=0),
+        torch.cat(pieces1, dim=0).contiguous(),
+        torch.cat(pieces2, dim=0).contiguous(),
+        torch.cat(pieces3, dim=0).contiguous(), 
+        slice_idx,
     )
 
 
@@ -455,11 +456,11 @@ class TritonAttentionImpl(AttentionImpl):
 
         prefill_decode_match = prefill_match or decode_match
 
-        out1, out2, out3 = slice_and_stitch_three(key, value, attn_metadata.slot_mapping, query_seq_lens, d_idx, g_idx, tp_rank, cpx_size, has_A, prefill_decode_match, prefill_match)
+        out1, out2, out3, slice_idx = slice_and_stitch_three(key, value, attn_metadata.slot_mapping, query_seq_lens, d_idx, g_idx, tp_rank, cpx_size, has_A, prefill_decode_match, prefill_match)
 
         location_match = cold_start_match or prefill_decode_match
 
-        location_match = True
+        #location_match = True
 
         #print(tp_rank, seqused_k[0].item(), has_A, location_match)
 
@@ -486,11 +487,11 @@ class TritonAttentionImpl(AttentionImpl):
                 )
             else:
                 torch.ops._C_cache_ops.reshape_and_cache_flash(
-                    key,
-                    value,
+                    out1,#key,
+                    out2,#value,
                     key_cache,
                     value_cache,
-                    attn_metadata.slot_mapping,
+                    out3,#attn_metadata.slot_mapping,
                     location_match,
                     self.kv_cache_dtype,
                     layer._k_scale,
@@ -549,6 +550,7 @@ class TritonAttentionImpl(AttentionImpl):
                 k=key_cache,
                 v=value_cache,
                 out=output[:num_actual_tokens],
+                slice_idx=slice_idx,
                 cu_seqlens_q=cu_seqlens_q,
                 max_seqlen_q=max_seqlen_q,
                 seqused_k=seqused_k,

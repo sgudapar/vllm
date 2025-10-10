@@ -720,6 +720,7 @@ def unified_attention(
     k,
     v,
     out,
+    slice_idx,
     cu_seqlens_q,
     max_seqlen_q,
     seqused_k,
