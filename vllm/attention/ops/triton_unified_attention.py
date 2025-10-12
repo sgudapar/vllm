@@ -971,7 +971,9 @@ def unified_attention(
         inter_xcd_outd = cpx_model_parallel_all_gather(out.contiguous(), dim=-2)
 
         #final_output = paged_reduct(inter_xcd_max_logit, inter_xcd_exp_sums, inter_xcd_outd, num_query_heads * 4)
-        out = paged_reduct(inter_xcd_max_logit, inter_xcd_exp_sums, inter_xcd_outd, num_query_heads * 4)
-
+        final_output = paged_reduct(inter_xcd_max_logit, inter_xcd_exp_sums, inter_xcd_outd, num_query_heads * 4)
+        splitted_final_output = [torch.empty_like(out, device=out.device,) for _ in range(cpx_size)]
+        splitted_final_output = final_output.chunk(cpx_size, dim=1)
+        out.copy_(splitted_final_output[tp_rank%cpx_size].to(query.dtype))
 
 
