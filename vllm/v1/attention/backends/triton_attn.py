@@ -551,6 +551,7 @@ class TritonAttentionImpl(AttentionImpl):
                 v=value_cache,
                 out=output[:num_actual_tokens],
                 slice_idx=slice_idx,
+                starscream_rank=g_idx,
                 cu_seqlens_q=cu_seqlens_q,
                 max_seqlen_q=max_seqlen_q,
                 seqused_k=seqused_k,

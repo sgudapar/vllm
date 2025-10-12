@@ -115,6 +115,8 @@ def kernel_unified_attention_2d(
         L_stride_1,
         M_stride_0,
         M_stride_1,
+        slice_idx,
+        starscream_rank,
         query_ptr,  # [num_tokens, num_query_heads, head_size]
         key_cache_ptr,  # [num_blks, blk_size, num_kv_heads, head_size]
         value_cache_ptr,  # [num_blks, blk_size, num_kv_heads, head_size]
@@ -233,9 +235,17 @@ def kernel_unified_attention_2d(
     max_seq_prefix_len = context_len + q_block_local_idx * BLOCK_Q + (
         BLOCK_M - 1) // num_queries_per_kv + 1
 
+    cpx_size = 4
+    base_ctx = seq_len // cpx_size
+    remainder_ctx = seq_len % cpx_size
+
+    seq_len = base_ctx + (starscream_rank < remainder_ctx)
+    context_len = tl.where(context_len == 0, context_len, seq_len - cur_batch_query_len)
+
     # adjust for potential padding in the last q_block by considering the
     # actual sequence length
     max_seq_prefix_len = tl.minimum(max_seq_prefix_len, seq_len)
+
 
     # calculate the number of tiles (blocks) that need to be processed to
     # cover the longest sequence prefix (due to causal masking, blocks beyond
@@ -287,7 +297,11 @@ def kernel_unified_attention_2d(
 
         seq_offset = j * BLOCK_SIZE + offs_n
 
-        seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
+        seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1 - slice_idx
+
+        #if context_len == 0 and kv_head_idx == 0:
+        #    tl.device_print("query_pos", (query_pos * 1000) + slice_idx)
+
 
         # S : (BLOCK_M, BLOCK_SIZE)
         S = tl.zeros(shape=(BLOCK_M, BLOCK_SIZE), dtype=tl.float32)
@@ -371,6 +385,7 @@ def kernel_unified_attention_3d(
         # [num_tokens, num_query_heads, num_segments, head_size]
         segm_max_ptr,  # [num_tokens, num_query_heads, num_segments]
         segm_expsum_ptr,  # [num_tokens, num_query_heads, num_segments]
+        starscream_rank,
         query_ptr,  # [num_tokens, num_query_heads, head_size]
         key_cache_ptr,  # [num_blks, num_kv_heads, head_size // x, blk_size, x]
         value_cache_ptr,  # [num_blks, num_kv_heads, head_size, blk_size]
@@ -434,6 +449,11 @@ def kernel_unified_attention_3d(
 
     # sequence len for this particular sequence
     seq_len = tl.load(seq_lens_ptr + seq_idx)
+    cpx_size = 4
+    base_ctx = seq_len // cpx_size
+    remainder_ctx = seq_len % cpx_size
+
+    seq_len = base_ctx + (starscream_rank < remainder_ctx)
 
     # number of segments for this particular sequence
     num_segments = NUM_SEGMENTS_PER_SEQ
@@ -631,6 +651,7 @@ def reduce_segments(
         L_stride_1,
         M_stride_0,
         M_stride_1,
+        starscream_rank,
         segm_output_ptr,
         #[num_tokens, num_query_heads, max_num_segments, head_size]
         segm_max_ptr,  # [num_tokens, num_query_heads, max_num_segments]
@@ -656,6 +677,11 @@ def reduce_segments(
 
     # sequence len for this particular sequence
     seq_len = tl.load(seq_lens_ptr + seq_idx)
+    cpx_size = 4
+    base_ctx = seq_len // cpx_size
+    remainder_ctx = seq_len % cpx_size
+
+    seq_len = base_ctx + (starscream_rank < remainder_ctx)
 
     # number of segments for this particular sequence
     num_segments = NUM_SEGMENTS_PER_SEQ
@@ -721,6 +747,7 @@ def unified_attention(
     v,
     out,
     slice_idx,
+    starscream_rank,
     cu_seqlens_q,
     max_seqlen_q,
     seqused_k,
@@ -789,6 +816,8 @@ def unified_attention(
             L_stride_1=xcd_exp_sum.stride(1),
             M_stride_0=xcd_max_logit.stride(0),
             M_stride_1=xcd_max_logit.stride(1),
+            slice_idx=slice_idx,
+            starscream_rank=starscream_rank,
             query_ptr=q,
             key_cache_ptr=k,
             value_cache_ptr=v,
@@ -863,6 +892,7 @@ def unified_attention(
                 segm_output_ptr=segm_output,
                 segm_max_ptr=segm_max,
                 segm_expsum_ptr=segm_expsum,
+                starscream_rank=starscream_rank,
                 query_ptr=q,
                 key_cache_ptr=k,
                 value_cache_ptr=v,
@@ -912,6 +942,7 @@ def unified_attention(
             L_stride_1=xcd_exp_sum.stride(1),
             M_stride_0=xcd_max_logit.stride(0),
             M_stride_1=xcd_max_logit.stride(1),
+            starscream_rank=starscream_rank,
             segm_output_ptr=segm_output,
             segm_max_ptr=segm_max,
             segm_expsum_ptr=segm_expsum,
@@ -929,14 +960,18 @@ def unified_attention(
             NUM_SEGMENTS_PER_SEQ=NUM_SEGMENTS,
         )
 
-    if not max_seqlen_q > 1:
+    cpx_size = 4
+
+    if cpx_size > 1:
         inter_xcd_max_logit = cpx_model_parallel_all_gather(xcd_max_logit.contiguous()) 
         inter_xcd_exp_sums = cpx_model_parallel_all_gather(xcd_exp_sum.contiguous())
-        outd = torch.empty_like(out)
-        outd.copy_(out)
-        inter_xcd_outd = cpx_model_parallel_all_gather(outd.contiguous(), dim=-2)
+        #outd = torch.empty_like(out)
+        #outd.copy_(out)
+        #inter_xcd_outd = cpx_model_parallel_all_gather(outd.contiguous(), dim=-2)
+        inter_xcd_outd = cpx_model_parallel_all_gather(out.contiguous(), dim=-2)
 
-        final_output = paged_reduct(inter_xcd_max_logit, inter_xcd_exp_sums, inter_xcd_outd, num_query_heads * 4)
+        #final_output = paged_reduct(inter_xcd_max_logit, inter_xcd_exp_sums, inter_xcd_outd, num_query_heads * 4)
+        out = paged_reduct(inter_xcd_max_logit, inter_xcd_exp_sums, inter_xcd_outd, num_query_heads * 4)
 
 
 
