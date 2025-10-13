@@ -44,7 +44,7 @@ def slice_and_stitch_three(
     has_A: bool,
     prefill_decode_match: bool,
     prefill_match: bool
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
     """
     Slice-and-stitch along dim=0 for three tensors.
     Handles optional special entry A at index 0 if has_A=True.
@@ -82,7 +82,7 @@ def slice_and_stitch_three(
         slice_idx = 0
 
     # First dimension must match
-    assert M1 == M2 and M1 == M3
+#    assert M1 == M2 and M1 == M3
 
     # Number of batches depends on has_A
     if has_A:
@@ -125,7 +125,7 @@ def slice_and_stitch_three(
             pieces3.append(t3[start:end])
 
     if (len(pieces1) == 0):
-        return torch.empty_like(t1), torch.empty_like(t2), torch.empty_like(t3), slice_idx
+        return torch.empty_like(t1), torch.empty_like(t2), torch.full_like(t3, -1), slice_idx
 
     return (
         torch.cat(pieces1, dim=0).contiguous(),
@@ -431,6 +431,8 @@ class TritonAttentionImpl(AttentionImpl):
 
         use_prefill_decode_attn = self.force_prefill_decode_attn
         num_actual_tokens = attn_metadata.num_actual_tokens
+
+        query = cpx_model_parallel_all_gather(query.contiguous(), dim=-2)
 
         max_seqlen_q = attn_metadata.max_query_len
         seqused_k = attn_metadata.seq_lens

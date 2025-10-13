@@ -792,6 +792,15 @@ def unified_attention(
     BLOCK_M = 16
     BLOCK_Q = BLOCK_M // num_queries_per_kv
 
+    outd = torch.empty(
+        q.shape[0],
+        num_query_heads,
+        out.shape[2],
+        dtype=out.dtype,
+        device=q.device,
+    )
+
+
     # Ideally we would launch with kernel with:
     # \sum_i[ceil(query_len[i] / BLOCK_Q)] blocks.
     # However, it is slow to realize the query_lens on cpu.
@@ -809,7 +818,7 @@ def unified_attention(
             total_num_q_blocks,
             num_kv_heads,
         )](
-            output_ptr=out,
+            output_ptr=outd,
             L_ptr=xcd_exp_sum,
             M_ptr=xcd_max_logit,
             L_stride_0=xcd_exp_sum.stride(0),
@@ -835,8 +844,8 @@ def unified_attention(
             block_table_stride=block_table.stride(0),
             query_stride_0=q.stride(0),
             query_stride_1=q.stride(1),
-            output_stride_0=out.stride(0),
-            output_stride_1=out.stride(1),
+            output_stride_0=outd.stride(0),
+            output_stride_1=outd.stride(1),
             qq_bias_stride_0=qq_bias.stride(0) if use_qq_bias else 0,
             BLOCK_SIZE=block_size,
             HEAD_SIZE=head_size,
@@ -935,7 +944,7 @@ def unified_attention(
             )
 
         reduce_segments[(q.shape[0], num_query_heads)](
-            output_ptr=out,
+            output_ptr=outd,
             L_ptr=xcd_exp_sum,
             M_ptr=xcd_max_logit,
             L_stride_0=xcd_exp_sum.stride(0),
@@ -949,8 +958,8 @@ def unified_attention(
             seq_lens_ptr=seqused_k,
             num_seqs=num_seqs,
             num_query_heads=num_query_heads,
-            output_stride_0=out.stride(0),
-            output_stride_1=out.stride(1),
+            output_stride_0=outd.stride(0),
+            output_stride_1=outd.stride(1),
             block_table_stride=block_table.stride(0),
             BLOCK_SIZE=block_size,
             HEAD_SIZE=head_size,
@@ -967,13 +976,16 @@ def unified_attention(
         inter_xcd_exp_sums = cpx_model_parallel_all_gather(xcd_exp_sum.contiguous())
         #outd = torch.empty_like(out)
         #outd.copy_(out)
-        #inter_xcd_outd = cpx_model_parallel_all_gather(outd.contiguous(), dim=-2)
-        inter_xcd_outd = cpx_model_parallel_all_gather(out.contiguous(), dim=-2)
+        inter_xcd_outd = cpx_model_parallel_all_gather(outd.contiguous(), dim=-2)
+        #inter_xcd_outd = cpx_model_parallel_all_gather(out.contiguous(), dim=-2)
 
         #final_output = paged_reduct(inter_xcd_max_logit, inter_xcd_exp_sums, inter_xcd_outd, num_query_heads * 4)
-        final_output = paged_reduct(inter_xcd_max_logit, inter_xcd_exp_sums, inter_xcd_outd, num_query_heads * 4)
+        final_output = paged_reduct(inter_xcd_max_logit, inter_xcd_exp_sums, inter_xcd_outd, num_query_heads)# * 4)
         splitted_final_output = [torch.empty_like(out, device=out.device,) for _ in range(cpx_size)]
         splitted_final_output = final_output.chunk(cpx_size, dim=1)
-        out.copy_(splitted_final_output[tp_rank%cpx_size].to(query.dtype))
+        #print("***********************************************")
+        #print(q.shape, final_output.shape, out.shape, outd.shape, len(splitted_final_output), starscream_rank)
+        #print("***********************************************")
+        out.copy_(splitted_final_output[starscream_rank].to(q.dtype))
 
 
