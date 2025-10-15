@@ -232,8 +232,14 @@ def kernel_unified_attention_2d(
 
     # compute the length of the longest sequence prefix spanned by any
     # query token in the current q_block (q_block_local_idx)
-    max_seq_prefix_len = context_len + q_block_local_idx * BLOCK_Q + (
+
+    test_flag = q_block_local_idx - (slice_idx // BLOCK_Q)
+    #max_seq_prefix_len = context_len + q_block_local_idx * BLOCK_Q + (
+    #    BLOCK_M - 1) // num_queries_per_kv + 1
+    max_seq_prefix_len = context_len + test_flag * BLOCK_Q + (
         BLOCK_M - 1) // num_queries_per_kv + 1
+    if (test_flag < 0):
+        max_seq_prefix_len = 0
 
     cpx_size = 4
     base_ctx = seq_len // cpx_size
@@ -241,6 +247,9 @@ def kernel_unified_attention_2d(
 
     seq_len = base_ctx + (starscream_rank < remainder_ctx)
     context_len = tl.where(context_len == 0, context_len, seq_len - cur_batch_query_len)
+
+#    if (starscream_rank == 1) and kv_head_idx == 0:
+#        tl.device_print("slice_idx", slice_idx)
 
     # adjust for potential padding in the last q_block by considering the
     # actual sequence length
@@ -298,6 +307,7 @@ def kernel_unified_attention_2d(
         seq_offset = j * BLOCK_SIZE + offs_n
 
         seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1 - slice_idx
+        #seq_mask2 = seq_offset[None, :] < max_seq_prefix_len
 
         #if context_len == 0 and kv_head_idx == 0:
         #    tl.device_print("query_pos", (query_pos * 1000) + slice_idx)
@@ -311,7 +321,7 @@ def kernel_unified_attention_2d(
         if USE_SOFTCAP:
             S = apply_softcap(S, softcap)
 
-        S = tl.where(query_mask_1[:, None] & query_mask_0[:, None] & seq_mask,
+        S = tl.where(query_mask_1[:, None] & query_mask_0[:, None] & seq_mask,# & seq_mask2,
                      S, float("-inf"))
 
         if SLIDING_WINDOW > 0:
@@ -360,7 +370,7 @@ def kernel_unified_attention_2d(
         acc += tl.dot(P.to(V.dtype), V)
 
     # epilogue
-    acc = acc / L[:, None]
+    #acc = acc / L[:, None]
 
     output_offset = (query_offset_0[:, None] * output_stride_0 +
                      query_offset_1[:, None] * output_stride_1 +

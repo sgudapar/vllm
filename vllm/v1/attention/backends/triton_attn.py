@@ -72,10 +72,10 @@ def slice_and_stitch_three(
 
     if (tp_rank < extra):
         slice_len = base + 1
-        slice_idx = tp_rank * (base + 1)
+        slice_idx = g_id * (base + 1)
     else:
         slice_len = base
-        slice_idx = extra * (base + 1) + (tp_rank - extra) * base
+        slice_idx = extra * (base + 1) + (g_id - extra) * base
 
     if not prefill_match:
         slice_len = 1
