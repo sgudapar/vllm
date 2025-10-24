@@ -111,7 +111,7 @@ def slice_and_stitch_three(
     base = N // cpx_size
     extra = N % cpx_size
 
-    if (tp_rank < extra):
+    if (g_id < extra):
         slice_len = base + 1
         slice_idx = g_id * (base + 1)
     else:
@@ -484,20 +484,12 @@ class TritonAttentionImpl(AttentionImpl):
         cpx_size = 4
         has_A = (len(seqused_k) == batch_size)
         query_seq_lens = max_seqlen_q
-        #new_seq = ((query_seq_lens + cpx_size - 1) // cpx_size) * cpx_size
-        #start_idx = 0
-        #slice_len = new_seq // cpx_size
         tp_rank = get_tensor_model_parallel_rank()
-        #slice_idx = ((tp_rank - start_idx + cpx_size) % cpx_size) * slice_len
 
         seq_lens_np = attn_metadata.seq_lens_np
 
-        #d_idx = (seqused_k[0].item() - 1) % cpx_size
         d_idx = (seq_lens_np[0] - 1) % cpx_size
-        #non_cold_location_match = (seqused_k[-1].item() - 1) % cpx_size
         non_cold_location_match = (seq_lens_np[-1] - 1) % cpx_size
-        #d_match = (seqused_k[0].item() - 1) % cpx_size
-        #d_idx = (d_match == tp_rank % cpx_size)
         g_idx = tp_rank % cpx_size
 
         prefill_match = (max_seqlen_q > 1)
@@ -515,7 +507,6 @@ class TritonAttentionImpl(AttentionImpl):
 
         location_match = cold_start_match or prefill_decode_match
 
-        #location_match = True
 #        if (tp_rank == 0): 
 #            print(seqused_k, attn_metadata.seq_lens_np)
 
