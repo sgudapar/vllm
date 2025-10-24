@@ -27,6 +27,8 @@ from vllm.distributed import (divide, get_tensor_model_parallel_rank,
                               split_tensor_along_last_dim,
                               tensor_model_parallel_all_gather, cpx_model_parallel_all_gather, cpx_model_parallel_all_reduce,
                               tensor_model_parallel_all_reduce)
+import numpy as np
+
 logger = init_logger(__name__)
 
 from typing import List, Tuple
@@ -192,6 +194,7 @@ class TritonAttentionMetadata:
     query_start_loc: torch.Tensor
     max_seq_len: int
     seq_lens: torch.Tensor
+    seq_lens_np: np.ndarray
     block_table: torch.Tensor
     slot_mapping: torch.Tensor
 
@@ -245,6 +248,7 @@ class TritonAttentionMetadataBuilder(
         max_seq_len = int(common_attn_metadata.seq_lens_cpu.max())
         query_start_loc = common_attn_metadata.query_start_loc
         seq_lens = common_attn_metadata.seq_lens
+        seq_lens_np = common_attn_metadata.seq_lens_cpu.numpy()
         block_table_tensor = common_attn_metadata.block_table_tensor
         slot_mapping = common_attn_metadata.slot_mapping
 
@@ -272,6 +276,7 @@ class TritonAttentionMetadataBuilder(
             query_start_loc=query_start_loc,
             max_seq_len=max_seq_len,
             seq_lens=seq_lens,
+            seq_lens_np=seq_lens_np,
             block_table=block_table_tensor,
             slot_mapping=slot_mapping,
             use_cascade=use_cascade,
@@ -485,8 +490,12 @@ class TritonAttentionImpl(AttentionImpl):
         tp_rank = get_tensor_model_parallel_rank()
         #slice_idx = ((tp_rank - start_idx + cpx_size) % cpx_size) * slice_len
 
-        d_idx = (seqused_k[0].item() - 1) % cpx_size
-        non_cold_location_match = (seqused_k[-1].item() - 1) % cpx_size
+        seq_lens_np = attn_metadata.seq_lens_np
+
+        #d_idx = (seqused_k[0].item() - 1) % cpx_size
+        d_idx = (seq_lens_np[0] - 1) % cpx_size
+        #non_cold_location_match = (seqused_k[-1].item() - 1) % cpx_size
+        non_cold_location_match = (seq_lens_np[-1] - 1) % cpx_size
         #d_match = (seqused_k[0].item() - 1) % cpx_size
         #d_idx = (d_match == tp_rank % cpx_size)
         g_idx = tp_rank % cpx_size
@@ -507,8 +516,8 @@ class TritonAttentionImpl(AttentionImpl):
         location_match = cold_start_match or prefill_decode_match
 
         #location_match = True
-
-        #print(tp_rank, seqused_k[0].item(), has_A, location_match)
+#        if (tp_rank == 0): 
+#            print(seqused_k, attn_metadata.seq_lens_np)
 
 
         if use_prefill_decode_attn:
