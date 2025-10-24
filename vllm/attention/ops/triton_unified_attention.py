@@ -668,6 +668,7 @@ def reduce_segments(
         segm_expsum_ptr,  # [num_tokens, num_query_heads, max_num_segments]
         seq_lens_ptr,  # [num_seqs]
         num_seqs,  # int
+        starscream_flag, # bool
         num_query_heads: tl.constexpr,  # int
         output_stride_0: tl.int64,  # int
         output_stride_1: tl.int64,  # int, should be equal to head_size
@@ -690,7 +691,6 @@ def reduce_segments(
     cpx_size = 4
     base_ctx = seq_len // cpx_size
     remainder_ctx = seq_len % cpx_size
-
     seq_len = base_ctx + (starscream_rank < remainder_ctx)
 
     # number of segments for this particular sequence
@@ -698,7 +698,11 @@ def reduce_segments(
     blocks_per_segment = cdiv_fn(seq_len, num_segments * BLOCK_SIZE)
 
     # create masks for subsequent loads
-    act_num_segments = cdiv_fn(seq_len, blocks_per_segment * BLOCK_SIZE)
+    if not starscream_flag:
+        act_num_segments = cdiv_fn(seq_len, blocks_per_segment * BLOCK_SIZE)
+    else:
+        act_num_segments = NUM_SEGMENTS_PER_SEQ
+
     segm_mask = tl.arange(0, NUM_SEGMENTS_PER_SEQ) < tl.full(
         [NUM_SEGMENTS_PER_SEQ], act_num_segments, dtype=tl.int32)
     dim_mask = tl.where(tl.arange(0, HEAD_SIZE_PADDED) < HEAD_SIZE, 1,
@@ -736,7 +740,10 @@ def reduce_segments(
     segm_output *= tl.exp(segm_max - overall_max)[:, None]
     acc_sum = tl.sum(segm_output, axis=0)
     # safely divide by overall_expsum, returning 0.0 if overall_expsum is 0
-    acc = tl.where(overall_expsum == 0.0, 0.0, acc_sum / overall_expsum)
+    if not starscream_flag: 
+        acc = tl.where(overall_expsum == 0.0, 0.0, acc_sum)
+    else:
+        acc = tl.where(overall_expsum == 0.0, 0.0, acc_sum / overall_expsum)
 
     exp_sum_offset = (query_token_idx * L_stride_0 + query_head_idx * L_stride_1)
     max_logit_offset = (query_token_idx * M_stride_0 + query_head_idx * M_stride_1)
@@ -806,7 +813,8 @@ def unified_attention(
         q.shape[0],
         num_query_heads,
         out.shape[2],
-        dtype=out.dtype,
+        dtype=torch.float32,
+        #dtype=out.dtype,
         device=q.device,
     )
 
@@ -905,6 +913,7 @@ def unified_attention(
             dtype=torch.float32,
             device=q.device,
         )
+        starscream_flag = False
 
         kernel_unified_attention_3d[(
             total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)](
@@ -967,6 +976,7 @@ def unified_attention(
             segm_expsum_ptr=segm_expsum,
             seq_lens_ptr=seqused_k,
             num_seqs=num_seqs,
+            starscream_flag=starscream_flag,
             num_query_heads=num_query_heads,
             output_stride_0=outd.stride(0),
             output_stride_1=outd.stride(1),
@@ -982,15 +992,53 @@ def unified_attention(
     cpx_size = 4
 
     if cpx_size > 1:
-        inter_xcd_max_logit = cpx_model_parallel_all_gather(xcd_max_logit.contiguous()) 
-        inter_xcd_exp_sums = cpx_model_parallel_all_gather(xcd_exp_sum.contiguous())
+        inter_xcd_max_logit = cpx_model_parallel_all_gather(xcd_max_logit.unsqueeze(-1).contiguous()).contiguous() 
+        inter_xcd_exp_sums = cpx_model_parallel_all_gather(xcd_exp_sum.unsqueeze(-1).contiguous()).contiguous()
         #outd = torch.empty_like(out)
         #outd.copy_(out)
-        inter_xcd_outd = cpx_model_parallel_all_gather(outd.contiguous(), dim=-2)
+        inter_xcd_outd = cpx_model_parallel_all_gather(outd.unsqueeze(2).contiguous(), dim=2).contiguous()
         #inter_xcd_outd = cpx_model_parallel_all_gather(out.contiguous(), dim=-2)
+        final_output = torch.empty(
+            q.shape[0],
+            num_query_heads,
+            #out.shape[2],
+            triton.next_power_of_2(head_size),
+            dtype=out.dtype,
+            device=q.device,
+        )
+        xcd_exp_sum_final = torch.empty( q.shape[0], num_query_heads, dtype=torch.float32, device=q.device,)
+        xcd_max_logit_final = torch.empty(q.shape[0], num_query_heads, dtype=torch.float32, device=q.device,)
+        starscream_flag = True
 
-        #final_output = paged_reduct(inter_xcd_max_logit, inter_xcd_exp_sums, inter_xcd_outd, num_query_heads * 4)
-        final_output = paged_reduct(inter_xcd_max_logit, inter_xcd_exp_sums, inter_xcd_outd, num_query_heads)# * 4)
+        reduce_segments[(q.shape[0], num_query_heads)](
+            output_ptr=final_output,
+            L_ptr=xcd_exp_sum_final,
+            M_ptr=xcd_max_logit_final,
+            L_stride_0=xcd_exp_sum_final.stride(0),
+            L_stride_1=xcd_exp_sum_final.stride(1),
+            M_stride_0=xcd_max_logit_final.stride(0),
+            M_stride_1=xcd_max_logit_final.stride(1),
+            starscream_rank=starscream_rank,
+            segm_output_ptr=inter_xcd_outd,
+            segm_max_ptr=inter_xcd_max_logit,
+            segm_expsum_ptr=inter_xcd_exp_sums,
+            seq_lens_ptr=seqused_k,
+            num_seqs=num_seqs,
+            starscream_flag=starscream_flag,
+            num_query_heads=num_query_heads,
+            output_stride_0=final_output.stride(0),
+            output_stride_1=final_output.stride(1),
+            block_table_stride=block_table.stride(0),
+            BLOCK_SIZE=block_size,
+            HEAD_SIZE=head_size,
+            HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
+            query_start_len_ptr=cu_seqlens_q,
+            BLOCK_Q=BLOCK_Q,
+            NUM_SEGMENTS_PER_SEQ=cpx_size,
+        )
+        
+
+        #final_output = paged_reduct(inter_xcd_max_logit, inter_xcd_exp_sums, inter_xcd_outd, num_query_heads)# * 4)
         splitted_final_output = [torch.empty_like(out, device=out.device,) for _ in range(cpx_size)]
         splitted_final_output = final_output.chunk(cpx_size, dim=1)
         #print("***********************************************")
