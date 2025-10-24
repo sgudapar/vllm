@@ -32,6 +32,45 @@ logger = init_logger(__name__)
 from typing import List, Tuple
 
 @torch.jit.script
+def slice_and_stitch_three_decode(
+    t1: torch.Tensor,
+    t2: torch.Tensor,
+    t3: torch.Tensor,
+    N: int,
+    d_idx: int,
+    g_id: int,
+    tp_rank: int,
+    cpx_size: int,
+    has_A: bool,
+    prefill_decode_match: bool,
+    num_batches: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+
+    slice_idx = 0
+
+    if has_A and g_id == d_idx:
+        out1 = torch.narrow(t1, 0, 0, 1)
+        out2 = torch.narrow(t2, 0, 0, 1)
+        out3 = torch.narrow(t3, 0, 0, 1)
+
+    elif (prefill_decode_match):
+        start = has_A
+        length = num_batches
+        out1 = torch.narrow(t1, 0, start, num_batches)
+        out2 = torch.narrow(t2, 0, start, num_batches)
+        out3 = torch.narrow(t3, 0, start, num_batches)
+
+    else:
+        out1 = torch.empty_like(t1)
+        out2 = torch.empty_like(t2)
+        out3 = torch.empty_like(t3)
+
+    return out1, out2, out3, slice_idx
+
+
+
+
+@torch.jit.script
 def slice_and_stitch_three(
     t1: torch.Tensor,
     t2: torch.Tensor,
@@ -458,7 +497,12 @@ class TritonAttentionImpl(AttentionImpl):
 
         prefill_decode_match = prefill_match or decode_match
 
-        out1, out2, out3, slice_idx = slice_and_stitch_three(key, value, attn_metadata.slot_mapping, query_seq_lens, d_idx, g_idx, tp_rank, cpx_size, has_A, prefill_decode_match, prefill_match)
+        num_batches = len(seqused_k) - has_A
+
+        if (prefill_match):
+            out1, out2, out3, slice_idx = slice_and_stitch_three(key, value, attn_metadata.slot_mapping, query_seq_lens, d_idx, g_idx, tp_rank, cpx_size, has_A, prefill_decode_match, prefill_match)
+        else:
+            out1, out2, out3, slice_idx = slice_and_stitch_three_decode(key, value, attn_metadata.slot_mapping, query_seq_lens, d_idx, g_idx, tp_rank, cpx_size, has_A, prefill_decode_match, num_batches)
 
         location_match = cold_start_match or prefill_decode_match
 
