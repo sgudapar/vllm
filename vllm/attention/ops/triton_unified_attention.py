@@ -15,63 +15,6 @@ from vllm.distributed import cpx_model_parallel_all_gather
 
 logger = init_logger(__name__)
 
-@torch.jit.script
-def paged_reduct(inter_xcd_max_logit: torch.Tensor, ## M_i
-                    inter_xcd_exp_sums: torch.Tensor,  ##L_i
-                    inter_xcd_outd: torch.Tensor,  ## O_i
-                    cpx_total_num_heads: int) -> torch.Tensor:
-
-    #fix view of AG tensors
-    all_XCD_logits = inter_xcd_max_logit.view(
-        inter_xcd_max_logit.shape[0],
-        inter_xcd_max_logit.shape[1] // cpx_total_num_heads,
-        cpx_total_num_heads
-    )
-
-    #same dim+sizes as M_i
-    all_XCD_exp_sums = inter_xcd_exp_sums.view(
-        inter_xcd_exp_sums.shape[0],
-        inter_xcd_exp_sums.shape[1] // cpx_total_num_heads,
-        cpx_total_num_heads
-    )
-    # review AG outd
-    # allgather in dim 1 instead of last dim -- fewer changes w.r.t. following compute
-    all_XCD_outd = inter_xcd_outd.view(
-        inter_xcd_outd.shape[0],
-        inter_xcd_outd.shape[1] // cpx_total_num_heads,
-        cpx_total_num_heads,
-        inter_xcd_outd.shape[2]
-    )
-
-    max_logits_final = torch.max(all_XCD_logits, dim=1)[0]
-
-    # expand is a view of original tensor.  tensor.repeat will return a new tensor
-    # -1 => don't change those dims
-    broadcast_max_logits_final = max_logits_final.unsqueeze(1).expand(-1, max_logits_final.shape[1] // cpx_total_num_heads, -1)
-
-
-    # shapes should match for the elt. subtraction
-    delta_logits = all_XCD_logits - broadcast_max_logits_final
-
-    # elt.wise op - no changes
-    alpha = torch.exp(delta_logits)
-
-    # torch.mul, '*' are elt. wise
-    per_xcd_exp_sums_offset = torch.mul(alpha, all_XCD_exp_sums)
-
-    per_xcd_exp_sums_expanded = per_xcd_exp_sums_offset.unsqueeze(-1)
-
-    all_xcd_output = all_XCD_outd * per_xcd_exp_sums_expanded
-
-    #### last stretch
-    # add O_* and L_*
-    added_all_xcd_output = torch.sum(all_xcd_output, dim=1)
-    added_all_xcd_exp_sums = torch.sum(per_xcd_exp_sums_expanded, dim=1)
-
-    # divide
-    outputs = added_all_xcd_output / added_all_xcd_exp_sums
-
-    return outputs
 
 
 
@@ -109,6 +52,10 @@ def find_seq_idx(query_start_len_ptr, target_idx, num_seqs,
 @triton.jit
 def kernel_unified_attention_2d(
         output_ptr,  # [num_tokens, num_query_heads, head_size]
+        starscream_meta_out_ptr,
+        ss_meta_stride_0,
+        ss_meta_stride_1,
+        ss_meta_stride_2,
         L_ptr,
         M_ptr,
         L_stride_0,
@@ -371,6 +318,16 @@ def kernel_unified_attention_2d(
 
     # epilogue
     #acc = acc / L[:, None]
+
+    ss_batch_offset = ( query_offset_0[:, None] * ss_meta_stride_0 + query_offset_1[:, None] * ss_meta_stride_1)
+    ss_output_offset = ss_batch_offset + offs_d[None, :]
+    ss_exp_sum_offset = ss_batch_offset + HEAD_SIZE_PADDED
+    ss_max_logit_offset = ss_batch_offset + HEAD_SIZE_PADDED + 1
+
+    tl.store(starscream_meta_out_ptr + ss_output_offset, acc, mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None])
+    tl.store(starscream_meta_out_ptr + ss_exp_sum_offset, L[:, None], mask=query_mask_0[:, None] & query_mask_1[:, None])
+    tl.store(starscream_meta_out_ptr + ss_max_logit_offset, M[:, None], mask=query_mask_0[:, None] & query_mask_1[:, None])
+
 
     output_offset = (query_offset_0[:, None] * output_stride_0 +
                      query_offset_1[:, None] * output_stride_1 +
@@ -655,6 +612,10 @@ def kernel_unified_attention_3d(
 @triton.jit
 def reduce_segments(
         output_ptr,  # [num_tokens, num_query_heads, head_size]
+        starscream_meta_out_ptr,
+        ss_meta_stride_0,
+        ss_meta_stride_1,
+        ss_meta_stride_2,
         L_ptr,
         M_ptr,
         L_stride_0,
@@ -708,35 +669,44 @@ def reduce_segments(
     dim_mask = tl.where(tl.arange(0, HEAD_SIZE_PADDED) < HEAD_SIZE, 1,
                         0).to(tl.int1)
 
-    # load segment maxima
-    segm_offset = (query_token_idx.to(tl.int64) *
-                   (num_query_heads * NUM_SEGMENTS_PER_SEQ) +
-                   query_head_idx * NUM_SEGMENTS_PER_SEQ +
-                   tl.arange(0, NUM_SEGMENTS_PER_SEQ))
-    segm_max = tl.load(segm_max_ptr + segm_offset,
-                       mask=segm_mask,
-                       other=float("-inf"))
-    overall_max = tl.max(segm_max)
+    if not starscream_flag:
+        # load segment maxima
+        segm_offset = (query_token_idx.to(tl.int64) *
+                       (num_query_heads * NUM_SEGMENTS_PER_SEQ) +
+                       query_head_idx * NUM_SEGMENTS_PER_SEQ +
+                       tl.arange(0, NUM_SEGMENTS_PER_SEQ))
+        segm_max = tl.load(segm_max_ptr + segm_offset,
+                           mask=segm_mask,
+                           other=float("-inf"))
+    
+        # load and rescale segment exp sums
+        segm_expsum = tl.load(segm_expsum_ptr + segm_offset,
+                              mask=segm_mask,
+                              other=0.0)
+        segm_output_offset = (query_token_idx.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED) + query_head_idx * (NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED) + tl.arange(0, NUM_SEGMENTS_PER_SEQ)[:, None] * HEAD_SIZE_PADDED + tl.arange(0, HEAD_SIZE_PADDED)[None, :])
+        
+        segm_output = tl.load(segm_output_ptr + segm_output_offset, mask=segm_mask[:, None] & dim_mask[None, :], other=0.0)
+    else: 
+        HEAD_SIZE_EXTENDED = HEAD_SIZE_PADDED + 2 
 
-    # load and rescale segment exp sums
-    segm_expsum = tl.load(segm_expsum_ptr + segm_offset,
-                          mask=segm_mask,
-                          other=0.0)
+        base_offset = (query_token_idx.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_EXTENDED) + query_head_idx * (NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_EXTENDED) + tl.arange(0, NUM_SEGMENTS_PER_SEQ) * HEAD_SIZE_EXTENDED) 
+
+        segm_output_ptr_local = segm_output_ptr + base_offset[:, None] + tl.arange(0, HEAD_SIZE_PADDED)[None, :] 
+        segm_exp_ptr_local    = segm_output_ptr + base_offset + HEAD_SIZE_PADDED
+        segm_logit_ptr_local  = segm_output_ptr + base_offset + HEAD_SIZE_PADDED + 1
+
+        segm_output = tl.load(segm_output_ptr_local, mask=segm_mask[:, None] & dim_mask[None, :], other=0.0)
+
+        segm_expsum = tl.load(segm_exp_ptr_local, mask=segm_mask, other=0.0)
+
+        segm_max = tl.load(segm_logit_ptr_local, mask=segm_mask, other=float("-inf"))
+
+
+    overall_max = tl.max(segm_max)
     segm_expsum = segm_expsum * tl.exp(segm_max - overall_max)
     overall_expsum = tl.sum(segm_expsum)
 
-    # load, rescale, and add segment attention outputs
-    segm_output_offset = (
-        query_token_idx.to(tl.int64) *
-        (num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED) +
-        query_head_idx * (NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED) +
-        tl.arange(0, NUM_SEGMENTS_PER_SEQ)[:, None] * HEAD_SIZE_PADDED +
-        tl.arange(0, HEAD_SIZE_PADDED)[None, :])
-    segm_output = tl.load(
-        segm_output_ptr + segm_output_offset,
-        mask=segm_mask[:, None] & dim_mask[None, :],
-        other=0.0,
-    )
+
     segm_output *= tl.exp(segm_max - overall_max)[:, None]
     acc_sum = tl.sum(segm_output, axis=0)
     # safely divide by overall_expsum, returning 0.0 if overall_expsum is 0
@@ -750,6 +720,27 @@ def reduce_segments(
 
     tl.store(L_ptr + exp_sum_offset, overall_expsum)
     tl.store(M_ptr + max_logit_offset, overall_max)
+
+
+    ss_output_offset = (query_token_idx * ss_meta_stride_0 +
+                     query_head_idx * ss_meta_stride_1 +
+                     0 * ss_meta_stride_2 +
+                     tl.arange(0, HEAD_SIZE_PADDED))
+    tl.store(starscream_meta_out_ptr + ss_output_offset, acc, mask=dim_mask)
+
+    ss_exp_sum_offset = (query_token_idx * ss_meta_stride_0 +
+                     query_head_idx * ss_meta_stride_1 +
+                     0 * ss_meta_stride_2 +
+                     HEAD_SIZE_PADDED)
+    tl.store(starscream_meta_out_ptr + ss_exp_sum_offset, overall_expsum)
+
+    ss_max_logit_offset = (query_token_idx * ss_meta_stride_0 +
+                     query_head_idx * ss_meta_stride_1 +
+                     0 * ss_meta_stride_2 +
+                     HEAD_SIZE_PADDED + 1)
+    tl.store(starscream_meta_out_ptr + ss_max_logit_offset, overall_max)
+
+
 
     # write result
     output_offset = (query_token_idx * output_stride_0 +
@@ -812,11 +803,22 @@ def unified_attention(
     outd = torch.empty(
         q.shape[0],
         num_query_heads,
-        out.shape[2],
+        triton.next_power_of_2(head_size),
+        #out.shape[2],
         dtype=torch.float32,
         #dtype=out.dtype,
         device=q.device,
     )
+
+    starscream_meta_out = torch.empty(
+        q.shape[0],
+        num_query_heads,
+        1,
+        triton.next_power_of_2(head_size) + 2,
+        dtype=torch.float32,
+        device=q.device,
+    )
+
 
 
     # Ideally we would launch with kernel with:
@@ -837,6 +839,10 @@ def unified_attention(
             num_kv_heads,
         )](
             output_ptr=outd,
+            starscream_meta_out_ptr=starscream_meta_out,
+            ss_meta_stride_0=starscream_meta_out.stride(0),
+            ss_meta_stride_1=starscream_meta_out.stride(1),
+            ss_meta_stride_2=starscream_meta_out.stride(2),
             L_ptr=xcd_exp_sum,
             M_ptr=xcd_max_logit,
             L_stride_0=xcd_exp_sum.stride(0),
@@ -964,6 +970,10 @@ def unified_attention(
 
         reduce_segments[(q.shape[0], num_query_heads)](
             output_ptr=outd,
+            starscream_meta_out_ptr=starscream_meta_out,
+            ss_meta_stride_0=starscream_meta_out.stride(0),
+            ss_meta_stride_1=starscream_meta_out.stride(1),
+            ss_meta_stride_2=starscream_meta_out.stride(2),
             L_ptr=xcd_exp_sum,
             M_ptr=xcd_max_logit,
             L_stride_0=xcd_exp_sum.stride(0),
@@ -992,12 +1002,9 @@ def unified_attention(
     cpx_size = 4
 
     if cpx_size > 1:
-        inter_xcd_max_logit = cpx_model_parallel_all_gather(xcd_max_logit.unsqueeze(-1).contiguous()).contiguous() 
-        inter_xcd_exp_sums = cpx_model_parallel_all_gather(xcd_exp_sum.unsqueeze(-1).contiguous()).contiguous()
-        #outd = torch.empty_like(out)
-        #outd.copy_(out)
-        inter_xcd_outd = cpx_model_parallel_all_gather(outd.unsqueeze(2).contiguous(), dim=2).contiguous()
-        #inter_xcd_outd = cpx_model_parallel_all_gather(out.contiguous(), dim=-2)
+        starscream_metadata = cpx_model_parallel_all_gather(starscream_meta_out.contiguous(), dim=-2).contiguous()
+        starscream_flag = True
+
         final_output = torch.empty(
             q.shape[0],
             num_query_heads,
@@ -1008,10 +1015,13 @@ def unified_attention(
         )
         xcd_exp_sum_final = torch.empty( q.shape[0], num_query_heads, dtype=torch.float32, device=q.device,)
         xcd_max_logit_final = torch.empty(q.shape[0], num_query_heads, dtype=torch.float32, device=q.device,)
-        starscream_flag = True
 
         reduce_segments[(q.shape[0], num_query_heads)](
             output_ptr=final_output,
+            starscream_meta_out_ptr=starscream_meta_out,
+            ss_meta_stride_0=starscream_meta_out.stride(0),
+            ss_meta_stride_1=starscream_meta_out.stride(1),
+            ss_meta_stride_2=starscream_meta_out.stride(2),
             L_ptr=xcd_exp_sum_final,
             M_ptr=xcd_max_logit_final,
             L_stride_0=xcd_exp_sum_final.stride(0),
@@ -1019,9 +1029,9 @@ def unified_attention(
             M_stride_0=xcd_max_logit_final.stride(0),
             M_stride_1=xcd_max_logit_final.stride(1),
             starscream_rank=starscream_rank,
-            segm_output_ptr=inter_xcd_outd,
-            segm_max_ptr=inter_xcd_max_logit,
-            segm_expsum_ptr=inter_xcd_exp_sums,
+            segm_output_ptr=starscream_metadata,
+            segm_max_ptr=xcd_max_logit,
+            segm_expsum_ptr=xcd_exp_sum,
             seq_lens_ptr=seqused_k,
             num_seqs=num_seqs,
             starscream_flag=starscream_flag,
