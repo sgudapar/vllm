@@ -56,12 +56,6 @@ def kernel_unified_attention_2d(
         ss_meta_stride_0,
         ss_meta_stride_1,
         ss_meta_stride_2,
-        L_ptr,
-        M_ptr,
-        L_stride_0,
-        L_stride_1,
-        M_stride_0,
-        M_stride_1,
         slice_idx,
         starscream_rank,
         query_ptr,  # [num_tokens, num_query_heads, head_size]
@@ -179,6 +173,9 @@ def kernel_unified_attention_2d(
 
     # compute the length of the longest sequence prefix spanned by any
     # query token in the current q_block (q_block_local_idx)
+
+    if (cur_batch_query_len == 1):
+        slice_idx = 0
 
     test_flag = q_block_local_idx - (slice_idx // BLOCK_Q)
     #max_seq_prefix_len = context_len + q_block_local_idx * BLOCK_Q + (
@@ -333,11 +330,6 @@ def kernel_unified_attention_2d(
                      query_offset_1[:, None] * output_stride_1 +
                      offs_d[None, :])
 
-    exp_sum_offset = (query_offset_0 * L_stride_0 + query_offset_1 * L_stride_1)
-    max_logit_offset = (query_offset_0 * M_stride_0 + query_offset_1 * M_stride_1)
-
-    tl.store(L_ptr + exp_sum_offset, L, mask=query_mask_0 & query_mask_1)
-    tl.store(M_ptr + max_logit_offset, M, mask=query_mask_0 & query_mask_1)
 
     tl.store(
         output_ptr + output_offset,
@@ -616,12 +608,6 @@ def reduce_segments(
         ss_meta_stride_0,
         ss_meta_stride_1,
         ss_meta_stride_2,
-        L_ptr,
-        M_ptr,
-        L_stride_0,
-        L_stride_1,
-        M_stride_0,
-        M_stride_1,
         starscream_rank,
         segm_output_ptr,
         #[num_tokens, num_query_heads, max_num_segments, head_size]
@@ -714,12 +700,6 @@ def reduce_segments(
         acc = tl.where(overall_expsum == 0.0, 0.0, acc_sum)
     else:
         acc = tl.where(overall_expsum == 0.0, 0.0, acc_sum / overall_expsum)
-
-    exp_sum_offset = (query_token_idx * L_stride_0 + query_head_idx * L_stride_1)
-    max_logit_offset = (query_token_idx * M_stride_0 + query_head_idx * M_stride_1)
-
-    tl.store(L_ptr + exp_sum_offset, overall_expsum)
-    tl.store(M_ptr + max_logit_offset, overall_max)
 
 
     ss_output_offset = (query_token_idx * ss_meta_stride_0 +
@@ -860,12 +840,6 @@ def unified_attention(
             ss_meta_stride_0=starscream_meta_out.stride(0),
             ss_meta_stride_1=starscream_meta_out.stride(1),
             ss_meta_stride_2=starscream_meta_out.stride(2),
-            L_ptr=xcd_exp_sum,
-            M_ptr=xcd_max_logit,
-            L_stride_0=xcd_exp_sum.stride(0),
-            L_stride_1=xcd_exp_sum.stride(1),
-            M_stride_0=xcd_max_logit.stride(0),
-            M_stride_1=xcd_max_logit.stride(1),
             slice_idx=slice_idx,
             starscream_rank=starscream_rank,
             query_ptr=q,
@@ -991,12 +965,6 @@ def unified_attention(
             ss_meta_stride_0=starscream_meta_out.stride(0),
             ss_meta_stride_1=starscream_meta_out.stride(1),
             ss_meta_stride_2=starscream_meta_out.stride(2),
-            L_ptr=xcd_exp_sum,
-            M_ptr=xcd_max_logit,
-            L_stride_0=xcd_exp_sum.stride(0),
-            L_stride_1=xcd_exp_sum.stride(1),
-            M_stride_0=xcd_max_logit.stride(0),
-            M_stride_1=xcd_max_logit.stride(1),
             starscream_rank=starscream_rank,
             segm_output_ptr=segm_output,
             segm_max_ptr=segm_max,
@@ -1022,29 +990,12 @@ def unified_attention(
         starscream_metadata = cpx_model_parallel_all_gather(starscream_meta_out.contiguous(), dim=-2).contiguous()
         starscream_flag = True
 
-        final_output = torch.empty(
-            q.shape[0],
-            num_query_heads,
-            #out.shape[2],
-            triton.next_power_of_2(head_size),
-            dtype=out.dtype,
-            device=q.device,
-        )
-        xcd_exp_sum_final = torch.empty( q.shape[0], num_query_heads, dtype=torch.float32, device=q.device,)
-        xcd_max_logit_final = torch.empty(q.shape[0], num_query_heads, dtype=torch.float32, device=q.device,)
-
         reduce_segments[(q.shape[0], num_query_heads)](
             output_ptr=out,
             starscream_meta_out_ptr=starscream_meta_out,
             ss_meta_stride_0=starscream_meta_out.stride(0),
             ss_meta_stride_1=starscream_meta_out.stride(1),
             ss_meta_stride_2=starscream_meta_out.stride(2),
-            L_ptr=xcd_exp_sum_final,
-            M_ptr=xcd_max_logit_final,
-            L_stride_0=xcd_exp_sum_final.stride(0),
-            L_stride_1=xcd_exp_sum_final.stride(1),
-            M_stride_0=xcd_max_logit_final.stride(0),
-            M_stride_1=xcd_max_logit_final.stride(1),
             starscream_rank=starscream_rank,
             segm_output_ptr=starscream_metadata,
             segm_max_ptr=xcd_max_logit,
@@ -1064,13 +1015,4 @@ def unified_attention(
             NUM_SEGMENTS_PER_SEQ=cpx_size,
         )
         
-
-        #final_output = paged_reduct(inter_xcd_max_logit, inter_xcd_exp_sums, inter_xcd_outd, num_query_heads)# * 4)
-#        splitted_final_output = [torch.empty_like(out, device=out.device,) for _ in range(cpx_size)]
-#        splitted_final_output = final_output.chunk(cpx_size, dim=1)
-        #print("***********************************************")
-        #print(q.shape, final_output.shape, out.shape, outd.shape, len(splitted_final_output), starscream_rank)
-        #print("***********************************************")
-#        out.copy_(splitted_final_output[starscream_rank].to(q.dtype))
-
 
