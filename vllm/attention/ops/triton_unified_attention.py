@@ -740,13 +740,30 @@ def reduce_segments(
                      HEAD_SIZE_PADDED + 1)
     tl.store(starscream_meta_out_ptr + ss_max_logit_offset, overall_max)
 
+    chunk_size = num_query_heads // cpx_size
+    chunk_start = starscream_rank * chunk_size
+    chunk_end = chunk_start + chunk_size
+
+    in_rank_mask = (query_head_idx >= chunk_start) & (query_head_idx < chunk_end)
+    local_head_idx = query_head_idx - chunk_start
+
+    if not starscream_flag:
+        output_mask = dim_mask
+        q_head_idx = query_head_idx
+    else:
+        output_mask = (dim_mask & in_rank_mask)
+        q_head_idx = local_head_idx
+
+#    out_offset = (query_token_idx * out_stride_0 + local_head_idx * out_stride_1 + tl.arange(0, HEAD_SIZE_PADDED))
+
+#    tl.store(out_ptr + out_offset, acc, mask=(dim_mask & in_rank_mask))
 
 
     # write result
     output_offset = (query_token_idx * output_stride_0 +
-                     query_head_idx * output_stride_1 +
+                     q_head_idx * output_stride_1 +
                      tl.arange(0, HEAD_SIZE_PADDED))
-    tl.store(output_ptr + output_offset, acc, mask=dim_mask)
+    tl.store(output_ptr + output_offset, acc, mask=output_mask)
 
 
 def unified_attention(
@@ -1017,7 +1034,7 @@ def unified_attention(
         xcd_max_logit_final = torch.empty(q.shape[0], num_query_heads, dtype=torch.float32, device=q.device,)
 
         reduce_segments[(q.shape[0], num_query_heads)](
-            output_ptr=final_output,
+            output_ptr=out,
             starscream_meta_out_ptr=starscream_meta_out,
             ss_meta_stride_0=starscream_meta_out.stride(0),
             ss_meta_stride_1=starscream_meta_out.stride(1),
@@ -1036,8 +1053,8 @@ def unified_attention(
             num_seqs=num_seqs,
             starscream_flag=starscream_flag,
             num_query_heads=num_query_heads,
-            output_stride_0=final_output.stride(0),
-            output_stride_1=final_output.stride(1),
+            output_stride_0=out.stride(0),
+            output_stride_1=out.stride(1),
             block_table_stride=block_table.stride(0),
             BLOCK_SIZE=block_size,
             HEAD_SIZE=head_size,
@@ -1049,11 +1066,11 @@ def unified_attention(
         
 
         #final_output = paged_reduct(inter_xcd_max_logit, inter_xcd_exp_sums, inter_xcd_outd, num_query_heads)# * 4)
-        splitted_final_output = [torch.empty_like(out, device=out.device,) for _ in range(cpx_size)]
-        splitted_final_output = final_output.chunk(cpx_size, dim=1)
+#        splitted_final_output = [torch.empty_like(out, device=out.device,) for _ in range(cpx_size)]
+#        splitted_final_output = final_output.chunk(cpx_size, dim=1)
         #print("***********************************************")
         #print(q.shape, final_output.shape, out.shape, outd.shape, len(splitted_final_output), starscream_rank)
         #print("***********************************************")
-        out.copy_(splitted_final_output[starscream_rank].to(q.dtype))
+#        out.copy_(splitted_final_output[starscream_rank].to(q.dtype))
 
 
