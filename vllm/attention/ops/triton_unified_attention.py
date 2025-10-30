@@ -669,13 +669,21 @@ def reduce_segments(
         segm_expsum = tl.load(segm_expsum_ptr + segm_offset,
                               mask=segm_mask,
                               other=0.0)
-        segm_output_offset = (query_token_idx.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED) + query_head_idx * (NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED) + tl.arange(0, NUM_SEGMENTS_PER_SEQ)[:, None] * HEAD_SIZE_PADDED + tl.arange(0, HEAD_SIZE_PADDED)[None, :])
+        segm_output_offset = (query_token_idx.to(tl.int64) * 
+                              (num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED) + 
+                              query_head_idx * (NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED) + 
+                              tl.arange(0, NUM_SEGMENTS_PER_SEQ)[:, None] * HEAD_SIZE_PADDED + 
+                              tl.arange(0, HEAD_SIZE_PADDED)[None, :])
         
         segm_output = tl.load(segm_output_ptr + segm_output_offset, mask=segm_mask[:, None] & dim_mask[None, :], other=0.0)
+
     else: 
         HEAD_SIZE_EXTENDED = HEAD_SIZE_PADDED + 2 
 
-        base_offset = (query_token_idx.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_EXTENDED) + query_head_idx * (NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_EXTENDED) + tl.arange(0, NUM_SEGMENTS_PER_SEQ) * HEAD_SIZE_EXTENDED) 
+        base_offset = (query_token_idx.to(tl.int64) * 
+                       (num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_EXTENDED) + 
+                       query_head_idx * (NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_EXTENDED) + 
+                       tl.arange(0, NUM_SEGMENTS_PER_SEQ) * HEAD_SIZE_EXTENDED) 
 
         segm_output_ptr_local = segm_output_ptr + base_offset[:, None] + tl.arange(0, HEAD_SIZE_PADDED)[None, :] 
         segm_exp_ptr_local    = segm_output_ptr + base_offset + HEAD_SIZE_PADDED
@@ -697,28 +705,28 @@ def reduce_segments(
     acc_sum = tl.sum(segm_output, axis=0)
     # safely divide by overall_expsum, returning 0.0 if overall_expsum is 0
     if not starscream_flag: 
-        acc = tl.where(overall_expsum == 0.0, 0.0, acc_sum)
+        acc = acc_sum
+
+        ss_output_offset = (query_token_idx * ss_meta_stride_0 +
+                         query_head_idx * ss_meta_stride_1 +
+                         0 * ss_meta_stride_2 +
+                         tl.arange(0, HEAD_SIZE_PADDED))
+        tl.store(starscream_meta_out_ptr + ss_output_offset, acc, mask=dim_mask)
+    
+        ss_exp_sum_offset = (query_token_idx * ss_meta_stride_0 +
+                         query_head_idx * ss_meta_stride_1 +
+                         0 * ss_meta_stride_2 +
+                         HEAD_SIZE_PADDED)
+        tl.store(starscream_meta_out_ptr + ss_exp_sum_offset, overall_expsum)
+    
+        ss_max_logit_offset = (query_token_idx * ss_meta_stride_0 +
+                         query_head_idx * ss_meta_stride_1 +
+                         0 * ss_meta_stride_2 +
+                         HEAD_SIZE_PADDED + 1)
+        tl.store(starscream_meta_out_ptr + ss_max_logit_offset, overall_max)
+
     else:
         acc = tl.where(overall_expsum == 0.0, 0.0, acc_sum / overall_expsum)
-
-
-    ss_output_offset = (query_token_idx * ss_meta_stride_0 +
-                     query_head_idx * ss_meta_stride_1 +
-                     0 * ss_meta_stride_2 +
-                     tl.arange(0, HEAD_SIZE_PADDED))
-    tl.store(starscream_meta_out_ptr + ss_output_offset, acc, mask=dim_mask)
-
-    ss_exp_sum_offset = (query_token_idx * ss_meta_stride_0 +
-                     query_head_idx * ss_meta_stride_1 +
-                     0 * ss_meta_stride_2 +
-                     HEAD_SIZE_PADDED)
-    tl.store(starscream_meta_out_ptr + ss_exp_sum_offset, overall_expsum)
-
-    ss_max_logit_offset = (query_token_idx * ss_meta_stride_0 +
-                     query_head_idx * ss_meta_stride_1 +
-                     0 * ss_meta_stride_2 +
-                     HEAD_SIZE_PADDED + 1)
-    tl.store(starscream_meta_out_ptr + ss_max_logit_offset, overall_max)
 
     chunk_size = num_query_heads // cpx_size
     chunk_start = starscream_rank * chunk_size
@@ -734,16 +742,11 @@ def reduce_segments(
         output_mask = (dim_mask & in_rank_mask)
         q_head_idx = local_head_idx
 
-#    out_offset = (query_token_idx * out_stride_0 + local_head_idx * out_stride_1 + tl.arange(0, HEAD_SIZE_PADDED))
-
-#    tl.store(out_ptr + out_offset, acc, mask=(dim_mask & in_rank_mask))
-
-
-    # write result
-    output_offset = (query_token_idx * output_stride_0 +
-                     q_head_idx * output_stride_1 +
-                     tl.arange(0, HEAD_SIZE_PADDED))
-    tl.store(output_ptr + output_offset, acc, mask=output_mask)
+        # write result
+        output_offset = (query_token_idx * output_stride_0 +
+                         q_head_idx * output_stride_1 +
+                         tl.arange(0, HEAD_SIZE_PADDED))
+        tl.store(output_ptr + output_offset, acc, mask=output_mask)
 
 
 def unified_attention(
