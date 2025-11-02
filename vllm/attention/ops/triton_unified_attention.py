@@ -251,7 +251,7 @@ def kernel_unified_attention_2d(
         seq_offset = j * BLOCK_SIZE + offs_n
 
         seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1 - slice_idx
-        #seq_mask2 = seq_offset[None, :] < max_seq_prefix_len
+        seq_mask2 = seq_offset[None, :] < max_seq_prefix_len
 
         #if context_len == 0 and kv_head_idx == 0:
         #    tl.device_print("query_pos", (query_pos * 1000) + slice_idx)
@@ -265,7 +265,7 @@ def kernel_unified_attention_2d(
         if USE_SOFTCAP:
             S = apply_softcap(S, softcap)
 
-        S = tl.where(query_mask_1[:, None] & query_mask_0[:, None] & seq_mask,# & seq_mask2,
+        S = tl.where(query_mask_1[:, None] & query_mask_0[:, None] & seq_mask & seq_mask2,
                      S, float("-inf"))
 
         if SLIDING_WINDOW > 0:
