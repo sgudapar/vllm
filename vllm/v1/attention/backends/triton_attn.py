@@ -23,7 +23,7 @@ from vllm.v1.attention.backends.utils import (AttentionCGSupport,
                                               CommonAttentionMetadata)
 from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.distributed import (divide, get_tensor_model_parallel_rank,
-                              get_tensor_model_parallel_world_size,
+                              get_tensor_model_parallel_world_size, get_starscream_parallel_world_size,
                               split_tensor_along_last_dim,
                               tensor_model_parallel_all_gather, cpx_model_parallel_all_gather, cpx_model_parallel_all_reduce,
                               tensor_model_parallel_all_reduce)
@@ -481,7 +481,7 @@ class TritonAttentionImpl(AttentionImpl):
         max_seqlen_q = attn_metadata.max_query_len
         seqused_k = attn_metadata.seq_lens
         batch_size = 2
-        cpx_size = 4
+        cpx_size = get_starscream_parallel_world_size()
         has_A = (len(seqused_k) == batch_size)
         query_seq_lens = max_seqlen_q
         tp_rank = get_tensor_model_parallel_rank()

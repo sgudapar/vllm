@@ -11,7 +11,7 @@ import torch
 
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
-from vllm.distributed import cpx_model_parallel_all_gather
+from vllm.distributed import cpx_model_parallel_all_gather, get_starscream_parallel_world_size
 
 logger = init_logger(__name__)
 
@@ -987,7 +987,7 @@ def unified_attention(
             NUM_SEGMENTS_PER_SEQ=NUM_SEGMENTS,
         )
 
-    cpx_size = 4
+    cpx_size = get_starscream_parallel_world_size()
 
     if cpx_size > 1:
         starscream_metadata = cpx_model_parallel_all_gather(starscream_meta_out.contiguous(), dim=-2).contiguous()

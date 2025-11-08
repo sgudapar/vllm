@@ -46,7 +46,6 @@ from vllm.logger import init_logger
 from vllm.utils import (direct_register_custom_op, get_distributed_init_method,
                         resolve_obj_by_qualname, supports_custom_op)
 
-
 @dataclass
 class GraphCaptureContext:
     stream: torch.cuda.Stream
@@ -1093,7 +1092,9 @@ def initialize_model_parallel(
         tensor_model_parallel_size)  # noqa
 
     # Build the cpx model-parallel groups.
-    cpx_model_parallel_size = 4
+    hf_config = config.model_config.hf_config
+    num_kv_heads = hf_config.num_key_value_heads
+    cpx_model_parallel_size = tensor_model_parallel_size // num_kv_heads
     num_cpx_model_parallel_groups: int = (world_size //
                                              cpx_model_parallel_size)
     global _CP
@@ -1241,6 +1242,9 @@ def patch_tensor_parallel_group(tp_group: GroupCoordinator):
         _TP_STATE_PATCHED = False
         _TP = old_tp_group
 
+def get_starscream_parallel_world_size():
+    """Return world size for the tensor model parallel group."""
+    return get_cp_group().world_size
 
 def get_tensor_model_parallel_world_size():
     """Return world size for the tensor model parallel group."""
