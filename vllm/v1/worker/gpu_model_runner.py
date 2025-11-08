@@ -79,7 +79,7 @@ from ..sample.logits_processor import LogitsProcessorManager
 from .utils import (AttentionGroup, MultiModalBudget, bind_kv_cache,
                     gather_mm_placeholders, initialize_kv_cache_for_kv_sharing,
                     sanity_check_mm_encoder_outputs, scatter_mm_placeholders)
-
+from vllm.distributed import get_starscream_parallel_world_size 
 if TYPE_CHECKING:
     import xgrammar as xgr
     import xgrammar.kernels.apply_token_bitmask_inplace_torch_compile as xgr_torch_compile  # noqa: E501
@@ -733,7 +733,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         N = np.repeat(num_scheduled_tokens, num_scheduled_tokens)
         N = np.asarray(N)
         pos = np.asarray(positions_np)
-        cpx_size = 4
+        cpx_size = get_starscream_parallel_world_size()
 
         base = N // cpx_size
         extra = N % cpx_size

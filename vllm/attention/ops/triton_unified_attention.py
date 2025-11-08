@@ -53,6 +53,7 @@ def find_seq_idx(query_start_len_ptr, target_idx, num_seqs,
 def kernel_unified_attention_2d(
         output_ptr,  # [num_tokens, num_query_heads, head_size]
         starscream_meta_out_ptr,
+        cpx_size,
         ss_meta_stride_0,
         ss_meta_stride_1,
         ss_meta_stride_2,
@@ -185,7 +186,6 @@ def kernel_unified_attention_2d(
     if (test_flag < 0):
         max_seq_prefix_len = 0
 
-    cpx_size = 4
     base_ctx = seq_len // cpx_size
     remainder_ctx = seq_len % cpx_size
 
@@ -345,6 +345,7 @@ def kernel_unified_attention_3d(
         segm_max_ptr,  # [num_tokens, num_query_heads, num_segments]
         segm_expsum_ptr,  # [num_tokens, num_query_heads, num_segments]
         starscream_rank,
+        cpx_size,
         query_ptr,  # [num_tokens, num_query_heads, head_size]
         key_cache_ptr,  # [num_blks, num_kv_heads, head_size // x, blk_size, x]
         value_cache_ptr,  # [num_blks, num_kv_heads, head_size, blk_size]
@@ -408,7 +409,6 @@ def kernel_unified_attention_3d(
 
     # sequence len for this particular sequence
     seq_len = tl.load(seq_lens_ptr + seq_idx)
-    cpx_size = 4
     base_ctx = seq_len // cpx_size
     remainder_ctx = seq_len % cpx_size
 
@@ -635,7 +635,7 @@ def reduce_segments(
 
     # sequence len for this particular sequence
     seq_len = tl.load(seq_lens_ptr + seq_idx)
-    cpx_size = 4
+    cpx_size = NUM_SEGMENTS_PER_SEQ
     base_ctx = seq_len // cpx_size
     remainder_ctx = seq_len % cpx_size
     seq_len = base_ctx + (starscream_rank < remainder_ctx)
@@ -831,6 +831,7 @@ def unified_attention(
     #   <= floor(\sum_i(query_len[i]) / BLOCK_Q) + num_seqs
     #    = floor(q.shape[0] / BLOCK_Q) + num_seqs
     total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
+    cpx_size = get_starscream_parallel_world_size()
 
     # if batch contains a prefill
     if max_seqlen_q > 1 or total_num_q_blocks * num_kv_heads > 128:
@@ -840,6 +841,7 @@ def unified_attention(
         )](
             output_ptr=outd,
             starscream_meta_out_ptr=starscream_meta_out,
+            cpx_size=cpx_size,
             ss_meta_stride_0=starscream_meta_out.stride(0),
             ss_meta_stride_1=starscream_meta_out.stride(1),
             ss_meta_stride_2=starscream_meta_out.stride(2),
@@ -921,6 +923,7 @@ def unified_attention(
                 segm_max_ptr=segm_max,
                 segm_expsum_ptr=segm_expsum,
                 starscream_rank=starscream_rank,
+                cpx_size=cpx_size,
                 query_ptr=q,
                 key_cache_ptr=k,
                 value_cache_ptr=v,
@@ -987,7 +990,6 @@ def unified_attention(
             NUM_SEGMENTS_PER_SEQ=NUM_SEGMENTS,
         )
 
-    cpx_size = get_starscream_parallel_world_size()
 
     if cpx_size > 1:
         starscream_metadata = cpx_model_parallel_all_gather(starscream_meta_out.contiguous(), dim=-2).contiguous()
