@@ -302,6 +302,8 @@ class EngineArgs:
     data_parallel_rpc_port: Optional[int] = None
     data_parallel_hybrid_lb: bool = False
     data_parallel_backend: str = ParallelConfig.data_parallel_backend
+    enable_starscream: bool = ParallelConfig.enable_starscream
+    num_prompts: int = ParallelConfig.num_prompts
     enable_expert_parallel: bool = ParallelConfig.enable_expert_parallel
     enable_eplb: bool = ParallelConfig.enable_eplb
     num_redundant_experts: int = ParallelConfig.num_redundant_experts
@@ -599,6 +601,9 @@ class EngineArgs:
         parallel_group.add_argument(
             "--distributed-executor-backend",
             **parallel_kwargs["distributed_executor_backend"])
+        parallel_group.add_argument(
+            "--enable-starscream", "-ss",
+            **parallel_kwargs["enable_starscream"])
         parallel_group.add_argument(
             "--pipeline-parallel-size", "-pp",
             **parallel_kwargs["pipeline_parallel_size"])
@@ -1220,6 +1225,8 @@ class EngineArgs:
             data_parallel_rpc_port=data_parallel_rpc_port,
             data_parallel_backend=self.data_parallel_backend,
             data_parallel_hybrid_lb=self.data_parallel_hybrid_lb,
+            enable_starscream=self.enable_starscream,
+            num_prompts=self.num_prompts,
             enable_expert_parallel=self.enable_expert_parallel,
             enable_eplb=self.enable_eplb,
             num_redundant_experts=self.num_redundant_experts,

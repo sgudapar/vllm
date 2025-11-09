@@ -378,6 +378,10 @@ class TritonAttentionImpl(AttentionImpl):
         self.head_size = head_size
         self.scale = float(scale)
         self.num_kv_heads = num_kv_heads
+        from vllm.config import get_current_vllm_config
+        config = get_current_vllm_config()
+        self.enable_starscream = config.parallel_config.enable_starscream
+        self.num_prompts = config.parallel_config.num_prompts
         if alibi_slopes is not None:
             alibi_slopes = torch.tensor(alibi_slopes, dtype=torch.float32)
         self.alibi_slopes = alibi_slopes
@@ -480,11 +484,13 @@ class TritonAttentionImpl(AttentionImpl):
 
         max_seqlen_q = attn_metadata.max_query_len
         seqused_k = attn_metadata.seq_lens
-        batch_size = 2
+        batch_size = self.num_prompts
         cpx_size = get_starscream_parallel_world_size()
         has_A = (len(seqused_k) == batch_size)
         query_seq_lens = max_seqlen_q
         tp_rank = get_tensor_model_parallel_rank()
+
+#        print(self.num_prompts)
 
         seq_lens_np = attn_metadata.seq_lens_np
 
