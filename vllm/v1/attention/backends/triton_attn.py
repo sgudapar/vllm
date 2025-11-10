@@ -480,42 +480,45 @@ class TritonAttentionImpl(AttentionImpl):
         use_prefill_decode_attn = self.force_prefill_decode_attn
         num_actual_tokens = attn_metadata.num_actual_tokens
 
-        query = cpx_model_parallel_all_gather(query.contiguous(), dim=-2)
+        if (self.enable_starscream):
+            query = cpx_model_parallel_all_gather(query.contiguous(), dim=-2)
 
-        max_seqlen_q = attn_metadata.max_query_len
-        seqused_k = attn_metadata.seq_lens
-        batch_size = self.num_prompts
-        cpx_size = get_starscream_parallel_world_size()
-        has_A = (len(seqused_k) == batch_size)
-        query_seq_lens = max_seqlen_q
-        tp_rank = get_tensor_model_parallel_rank()
+            max_seqlen_q = attn_metadata.max_query_len
+            seqused_k = attn_metadata.seq_lens
+            batch_size = self.num_prompts
+            cpx_size = get_starscream_parallel_world_size()
+            has_A = (len(seqused_k) == batch_size)
+            query_seq_lens = max_seqlen_q
+            tp_rank = get_tensor_model_parallel_rank()
 
-#        print(self.num_prompts)
+            seq_lens_np = attn_metadata.seq_lens_np
 
-        seq_lens_np = attn_metadata.seq_lens_np
+            d_idx = (seq_lens_np[0] - 1) % cpx_size
+            non_cold_location_match = (seq_lens_np[-1] - 1) % cpx_size
+            g_idx = tp_rank % cpx_size
 
-        d_idx = (seq_lens_np[0] - 1) % cpx_size
-        non_cold_location_match = (seq_lens_np[-1] - 1) % cpx_size
-        g_idx = tp_rank % cpx_size
+            prefill_match = (max_seqlen_q > 1)
+            decode_match = (non_cold_location_match == g_idx)
+            cold_start_match = (d_idx == g_idx)
 
-        prefill_match = (max_seqlen_q > 1)
-        decode_match = (non_cold_location_match == g_idx)
-        cold_start_match = (d_idx == g_idx)
+            prefill_decode_match = prefill_match or decode_match
 
-        prefill_decode_match = prefill_match or decode_match
+            num_batches = len(seqused_k) - has_A
 
-        num_batches = len(seqused_k) - has_A
+            if (prefill_match):
+                out1, out2, out3, slice_idx = slice_and_stitch_three(key, value, attn_metadata.slot_mapping, query_seq_lens, d_idx, g_idx, tp_rank, cpx_size, has_A, prefill_decode_match, prefill_match)
+            else:
+                out1, out2, out3, slice_idx = slice_and_stitch_three_decode(key, value, attn_metadata.slot_mapping, query_seq_lens, d_idx, g_idx, tp_rank, cpx_size, has_A, prefill_decode_match, num_batches)
 
-        if (prefill_match):
-            out1, out2, out3, slice_idx = slice_and_stitch_three(key, value, attn_metadata.slot_mapping, query_seq_lens, d_idx, g_idx, tp_rank, cpx_size, has_A, prefill_decode_match, prefill_match)
+            location_match = cold_start_match or prefill_decode_match
         else:
-            out1, out2, out3, slice_idx = slice_and_stitch_three_decode(key, value, attn_metadata.slot_mapping, query_seq_lens, d_idx, g_idx, tp_rank, cpx_size, has_A, prefill_decode_match, num_batches)
-
-        location_match = cold_start_match or prefill_decode_match
-
-#        if (tp_rank == 0): 
-#            print(seqused_k, attn_metadata.seq_lens_np)
-
+            location_match = True
+            out1 = key
+            out2 = value
+            out3 = attn_metadata.slot_mapping
+            slice_idx = 0
+            g_idx = 0
+            cpx_size = 1
 
         if use_prefill_decode_attn:
             key_cache, value_cache = PagedAttention.split_kv_cache(
@@ -618,6 +621,8 @@ class TritonAttentionImpl(AttentionImpl):
                 k_descale=layer._k_scale.expand(descale_shape),
                 v_descale=layer._v_scale.expand(descale_shape),
                 sinks=self.sinks,
+                cpx_size=cpx_size,
+                enable_starscream=self.enable_starscream,
             )
 
         return output

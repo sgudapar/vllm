@@ -730,32 +730,32 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                            torch.from_numpy(token_indices),
                            out=self.input_ids_cpu[:total_num_scheduled_tokens])
 
-        N = np.repeat(num_scheduled_tokens, num_scheduled_tokens)
-        N = np.asarray(N)
-        pos = np.asarray(positions_np)
-        cpx_size = get_starscream_parallel_world_size()
+        if (self.vllm_config.parallel_config.enable_starscream):
+            N = np.repeat(num_scheduled_tokens, num_scheduled_tokens)
+            N = np.asarray(N)
+            pos = np.asarray(positions_np)
+            cpx_size = get_starscream_parallel_world_size()
 
-        base = N // cpx_size
-        extra = N % cpx_size
+            base = N // cpx_size
+            extra = N % cpx_size
 
-        threshold = (base + 1) * extra
+            threshold = (base + 1) * extra
 
-        index_in_group = np.empty_like(pos)
-        # Decode case
-        is_single = N == 1
-        index_in_group[is_single] = pos[is_single] // cpx_size
+            index_in_group = np.empty_like(pos)
+            # Decode case
+            is_single = N == 1
+            index_in_group[is_single] = pos[is_single] // cpx_size
 
-        #prefill has 2 cases
-        is_first_branch = (pos < threshold) & (~is_single)
-        is_second_branch = (~is_first_branch) & (~is_single)
+            #prefill has 2 cases
+            is_first_branch = (pos < threshold) & (~is_single)
+            is_second_branch = (~is_first_branch) & (~is_single)
 
-        index_in_group[is_first_branch] = (pos[is_first_branch] % (base[is_first_branch] + 1))
-        index_in_group[is_second_branch] = ((pos[is_second_branch] - threshold[is_second_branch]) % base[is_second_branch])
-
+            index_in_group[is_first_branch] = (pos[is_first_branch] % (base[is_first_branch] + 1))
+            index_in_group[is_second_branch] = ((pos[is_second_branch] - threshold[is_second_branch]) % base[is_second_branch])
+            positions_np = index_in_group
 
         self.input_batch.block_table.compute_slot_mapping(
-            req_indices, index_in_group)
-            #req_indices, positions_np)
+            req_indices, positions_np)
         self.input_batch.block_table.commit_slot_mapping(
             total_num_scheduled_tokens)
 
