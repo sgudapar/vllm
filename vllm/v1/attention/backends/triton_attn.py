@@ -40,8 +40,7 @@ def slice_and_stitch_three_decode(
     t3: torch.Tensor,
     N: int,
     d_idx: int,
-    g_id: int,
-    tp_rank: int,
+    starscream_rank: int,
     cpx_size: int,
     has_A: bool,
     prefill_decode_match: bool,
@@ -50,7 +49,7 @@ def slice_and_stitch_three_decode(
 
     slice_idx = 0
 
-    if has_A and g_id == d_idx:
+    if has_A and starscream_rank == d_idx:
         out1 = torch.narrow(t1, 0, 0, 1)
         out2 = torch.narrow(t2, 0, 0, 1)
         out3 = torch.narrow(t3, 0, 0, 1)
@@ -69,9 +68,6 @@ def slice_and_stitch_three_decode(
 
     return out1, out2, out3, slice_idx
 
-
-
-
 @torch.jit.script
 def slice_and_stitch_three(
     t1: torch.Tensor,
@@ -79,8 +75,7 @@ def slice_and_stitch_three(
     t3: torch.Tensor,
     N: int,
     d_idx: int,
-    g_id: int,
-    tp_rank: int,
+    starscream_rank: int,
     cpx_size: int,
     has_A: bool,
     prefill_decode_match: bool,
@@ -98,52 +93,38 @@ def slice_and_stitch_three(
         N: prefill length
         slice_idx: start index within each batch slice
         slice_len: number of items to take
-        d_idx, g_id: include entry 0 ("A") only if has_A and g_id == d_idx
+        d_idx, starscream_rank: include entry 0 ("A") only if has_A and starscream_rank == d_idx
         has_A: whether the tensors contain a special entry at index 0
 
     Returns:
         (out1, out2, out3): stitched tensors from t1, t2, t3
     """
     M1 = t1.size(0)
-    M2 = t2.size(0)
-    M3 = t3.size(0)
 
     base = N // cpx_size
     extra = N % cpx_size
 
-    if (g_id < extra):
+    if (starscream_rank < extra):
         slice_len = base + 1
-        slice_idx = g_id * (base + 1)
+        slice_idx = starscream_rank * (base + 1)
     else:
         slice_len = base
-        slice_idx = extra * (base + 1) + (g_id - extra) * base
-
-    if not prefill_match:
-        slice_len = 1
-        slice_idx = 0
-
-    # First dimension must match
-#    assert M1 == M2 and M1 == M3
+        slice_idx = extra * (base + 1) + (starscream_rank - extra) * base
 
     # Number of batches depends on has_A
     if has_A:
-        #assert (M1 - 1) % N == 0
         num_batches = (M1 - 1) // N
         base_offset = 1
     else:
-        #assert M1 % N == 0
         num_batches = M1 // N
         base_offset = 0
-
-#    assert slice_idx >= 0
-#    assert slice_len >= 0
 
     pieces1: List[torch.Tensor] = []
     pieces2: List[torch.Tensor] = []
     pieces3: List[torch.Tensor] = []
 
     # Include A if requested
-    if has_A and g_id == d_idx:
+    if has_A and starscream_rank == d_idx:
         pieces1.append(t1[0:1])
         pieces2.append(t2[0:1])
         pieces3.append(t3[0:1])
@@ -174,10 +155,6 @@ def slice_and_stitch_three(
         torch.cat(pieces3, dim=0).contiguous(), 
         slice_idx,
     )
-
-
-
-
 
 @dataclass
 class TritonAttentionMetadata:
@@ -378,6 +355,9 @@ class TritonAttentionImpl(AttentionImpl):
         self.head_size = head_size
         self.scale = float(scale)
         self.num_kv_heads = num_kv_heads
+        self.cpx_size = get_starscream_parallel_world_size()
+        tp_rank = get_tensor_model_parallel_rank()
+        self.starscream_rank = tp_rank % self.cpx_size
         from vllm.config import get_current_vllm_config
         config = get_current_vllm_config()
         self.enable_starscream = config.parallel_config.enable_starscream
@@ -486,29 +466,25 @@ class TritonAttentionImpl(AttentionImpl):
             max_seqlen_q = attn_metadata.max_query_len
             seqused_k = attn_metadata.seq_lens
             batch_size = self.num_prompts
-            cpx_size = get_starscream_parallel_world_size()
             has_A = (len(seqused_k) == batch_size)
-            query_seq_lens = max_seqlen_q
-            tp_rank = get_tensor_model_parallel_rank()
 
             seq_lens_np = attn_metadata.seq_lens_np
 
-            d_idx = (seq_lens_np[0] - 1) % cpx_size
-            non_cold_location_match = (seq_lens_np[-1] - 1) % cpx_size
-            g_idx = tp_rank % cpx_size
+            d_idx = (seq_lens_np[0] - 1) % self.cpx_size
+            non_cold_location_match = (seq_lens_np[-1] - 1) % self.cpx_size
 
             prefill_match = (max_seqlen_q > 1)
-            decode_match = (non_cold_location_match == g_idx)
-            cold_start_match = (d_idx == g_idx)
+            decode_match = (non_cold_location_match == self.starscream_rank)
+            cold_start_match = (d_idx == self.starscream_rank)
 
             prefill_decode_match = prefill_match or decode_match
 
             num_batches = len(seqused_k) - has_A
 
             if (prefill_match):
-                out1, out2, out3, slice_idx = slice_and_stitch_three(key, value, attn_metadata.slot_mapping, query_seq_lens, d_idx, g_idx, tp_rank, cpx_size, has_A, prefill_decode_match, prefill_match)
+                out1, out2, out3, slice_idx = slice_and_stitch_three(key, value, attn_metadata.slot_mapping, max_seqlen_q, d_idx, self.starscream_rank, self.cpx_size, has_A, prefill_decode_match, prefill_match)
             else:
-                out1, out2, out3, slice_idx = slice_and_stitch_three_decode(key, value, attn_metadata.slot_mapping, query_seq_lens, d_idx, g_idx, tp_rank, cpx_size, has_A, prefill_decode_match, num_batches)
+                out1, out2, out3, slice_idx = slice_and_stitch_three_decode(key, value, attn_metadata.slot_mapping, max_seqlen_q, d_idx, self.starscream_rank, self.cpx_size, has_A, prefill_decode_match, num_batches)
 
             location_match = cold_start_match or prefill_decode_match
         else:
@@ -517,8 +493,7 @@ class TritonAttentionImpl(AttentionImpl):
             out2 = value
             out3 = attn_metadata.slot_mapping
             slice_idx = 0
-            g_idx = 0
-            cpx_size = 1
+            self.starscream_rank = 0
 
         if use_prefill_decode_attn:
             key_cache, value_cache = PagedAttention.split_kv_cache(
@@ -606,7 +581,7 @@ class TritonAttentionImpl(AttentionImpl):
                 v=value_cache,
                 out=output[:num_actual_tokens],
                 slice_idx=slice_idx,
-                starscream_rank=g_idx,
+                starscream_rank=self.starscream_rank,
                 cu_seqlens_q=cu_seqlens_q,
                 max_seqlen_q=max_seqlen_q,
                 seqused_k=seqused_k,
@@ -621,7 +596,7 @@ class TritonAttentionImpl(AttentionImpl):
                 k_descale=layer._k_scale.expand(descale_shape),
                 v_descale=layer._v_scale.expand(descale_shape),
                 sinks=self.sinks,
-                cpx_size=cpx_size,
+                cpx_size=self.cpx_size,
                 enable_starscream=self.enable_starscream,
             )
 

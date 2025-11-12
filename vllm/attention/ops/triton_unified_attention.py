@@ -175,30 +175,24 @@ def kernel_unified_attention_2d(
 
     # compute the length of the longest sequence prefix spanned by any
     # query token in the current q_block (q_block_local_idx)
-
     if (cur_batch_query_len == 1) or (not enable_starscream):
         slice_idx = 0
 
-    test_flag = q_block_local_idx - (slice_idx // BLOCK_Q)
-    #max_seq_prefix_len = context_len + q_block_local_idx * BLOCK_Q + (
-    #    BLOCK_M - 1) // num_queries_per_kv + 1
-    max_seq_prefix_len = context_len + test_flag * BLOCK_Q + (
+    q_block_local_idx_adjusted = q_block_local_idx - (slice_idx // BLOCK_Q)
+    max_seq_prefix_len = context_len + q_block_local_idx_adjusted * BLOCK_Q + (
         BLOCK_M - 1) // num_queries_per_kv + 1
 
     if enable_starscream:
-        if (test_flag < 0):
+        if (q_block_local_idx_adjusted < 0):
             max_seq_prefix_len = 0
     
         base_ctx = seq_len // cpx_size
         remainder_ctx = seq_len % cpx_size
-    
         seq_len = base_ctx + (starscream_rank < remainder_ctx)
         context_len = tl.where(context_len == 0, context_len, seq_len - cur_batch_query_len)
-
     # adjust for potential padding in the last q_block by considering the
     # actual sequence length
     max_seq_prefix_len = tl.minimum(max_seq_prefix_len, seq_len)
-
 
     # calculate the number of tiles (blocks) that need to be processed to
     # cover the longest sequence prefix (due to causal masking, blocks beyond
@@ -642,7 +636,6 @@ def reduce_segments(
         remainder_ctx = seq_len % cpx_size
         seq_len = base_ctx + (starscream_rank < remainder_ctx)
 
-
     # number of segments for this particular sequence
     num_segments = NUM_SEGMENTS_PER_SEQ
     blocks_per_segment = cdiv_fn(seq_len, num_segments * BLOCK_SIZE)
@@ -698,11 +691,9 @@ def reduce_segments(
 
         segm_max = tl.load(segm_logit_ptr_local, mask=segm_mask, other=float("-inf"))
 
-
     overall_max = tl.max(segm_max)
     segm_expsum = segm_expsum * tl.exp(segm_max - overall_max)
     overall_expsum = tl.sum(segm_expsum)
-
 
     segm_output *= tl.exp(segm_max - overall_max)[:, None]
     acc_sum = tl.sum(segm_output, axis=0)
@@ -731,7 +722,6 @@ def reduce_segments(
     else:
         acc = tl.where(overall_expsum == 0.0, 0.0, acc_sum / overall_expsum)
 
-
     if enable_starscream and starscream_flag:
         chunk_size = num_query_heads // cpx_size
         chunk_start = starscream_rank * chunk_size
@@ -744,13 +734,11 @@ def reduce_segments(
         output_mask = dim_mask
         q_head_idx = query_head_idx
 
-
         # write result
     output_offset = (query_token_idx * output_stride_0 +
                      q_head_idx * output_stride_1 +
                      tl.arange(0, HEAD_SIZE_PADDED))
     tl.store(output_ptr + output_offset, acc, mask=output_mask)
-
 
 def unified_attention(
     q,
@@ -827,8 +815,6 @@ def unified_attention(
         device=q.device,
     )
 
-
-
     # Ideally we would launch with kernel with:
     # \sum_i[ceil(query_len[i] / BLOCK_Q)] blocks.
     # However, it is slow to realize the query_lens on cpu.
@@ -839,7 +825,6 @@ def unified_attention(
     #   <= floor(\sum_i(query_len[i]) / BLOCK_Q) + num_seqs
     #    = floor(q.shape[0] / BLOCK_Q) + num_seqs
     total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
-
     # if batch contains a prefill
     if max_seqlen_q > 1 or total_num_q_blocks * num_kv_heads > 128:
         kernel_unified_attention_2d[(
@@ -1000,7 +985,6 @@ def unified_attention(
             BLOCK_Q=BLOCK_Q,
             NUM_SEGMENTS_PER_SEQ=NUM_SEGMENTS,
         )
-
 
     if cpx_size > 1 and enable_starscream:
         starscream_metadata = cpx_model_parallel_all_gather(starscream_meta_out.contiguous(), dim=-2).contiguous()
